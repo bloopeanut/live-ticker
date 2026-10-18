@@ -60,6 +60,7 @@ LEAGUES = [
     ("csoft",  "NCAA SB",   "csoft",    "baseball/college-softball",            None,     {"kind": "baseball", "innings": 7, "half": 7},   False, True,  "#2a7a46"),
     ("mlax",   "NCAAM LAX", "claxm",     "lacrosse/mens-college-lacrosse",       None,     clock(4, 15, 4, 2.0, {2: 10}),                   False, True,  "#5c4a9e"),
     ("wlax",   "NCAAW LAX", "claxw",     "lacrosse/womens-college-lacrosse",     None,     clock(4, 15, 3, 2.0, {2: 10}),                   False, True,  "#7a4a9e"),
+    ("mhky",   "NCAAM HKY", "chkym",    "hockey/mens-college-hockey",           None,     clock(3, 20, 5, 2.0, {1: 15, 2: 15}),            False, True,  "#2f6b74"),
     ("nfl",    "NFL",       "pfb",      "football/nfl",                         None,     clock(4, 15, 10, 2.9, {2: 13}),                  False, False, "#0a3a7a"),
     ("cfl",    "CFL",       "pfb",      "football/cfl",                         None,     clock(4, 15, 0, 2.7, {2: 15}),                   False, False, "#b5121b"),
     ("ufl",    "UFL",       "pfb",      "football/ufl",                         None,     clock(4, 15, 0, 2.9, {2: 13}),                   False, False, "#1b3f8f"),
@@ -91,6 +92,7 @@ SPORTS = [
     ("csoft", "COLLEGE SOFTBALL"),
     ("claxm", "MEN'S COLLEGE LACROSSE"),
     ("claxw", "WOMEN'S COLLEGE LACROSSE"),
+    ("chkym", "MEN'S COLLEGE HOCKEY"),
     ("pfb",   "PRO FOOTBALL"),
     ("pbb",   "PRO BASKETBALL"),
     ("mlb",   "MLB"),
@@ -519,6 +521,93 @@ NAME_FG = SCORE_FG = RANK_FG = STATUS_FG = DIM_FG = POSS_FG = REDZONE_FG = FG
 SEP_FG = "#444444"
 
 
+# --------------------------------------------------------------------------
+# Start automatically at login
+# --------------------------------------------------------------------------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_NAME = "LiveTicker"
+
+
+def _launch_command():
+    """Command line that starts the ticker with no console window."""
+    if getattr(sys, "frozen", False):                     # packaged .exe / .app
+        return [sys.executable]
+    exe = sys.executable
+    if sys.platform == "win32":
+        w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(w):
+            exe = w
+    return [exe, os.path.abspath(__file__)]
+
+
+def _mac_plist():
+    return os.path.expanduser("~/Library/LaunchAgents/com.liveticker.plist")
+
+
+def _linux_desktop():
+    return os.path.expanduser("~/.config/autostart/live-ticker.desktop")
+
+
+def startup_enabled():
+    try:
+        if sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+                winreg.QueryValueEx(k, STARTUP_NAME)
+            return True
+        if sys.platform == "darwin":
+            return os.path.exists(_mac_plist())
+        return os.path.exists(_linux_desktop())
+    except OSError:
+        return False
+
+
+def set_startup(enable):
+    """Turn start-at-login on or off. Returns True on success."""
+    cmd = _launch_command()
+    try:
+        if sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                if enable:
+                    winreg.SetValueEx(k, STARTUP_NAME, 0, winreg.REG_SZ,
+                                      " ".join('"%s"' % c for c in cmd))
+                else:
+                    try:
+                        winreg.DeleteValue(k, STARTUP_NAME)
+                    except FileNotFoundError:
+                        pass
+        elif sys.platform == "darwin":
+            path = _mac_plist()
+            if enable:
+                if getattr(sys, "frozen", False) and ".app/" in sys.executable:
+                    app = sys.executable.split(".app/")[0] + ".app"
+                    cmd = ["/usr/bin/open", "-a", app]
+                args = "".join("<string>%s</string>" % c for c in cmd)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+                            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                            '<plist version="1.0"><dict><key>Label</key><string>com.liveticker</string>'
+                            '<key>ProgramArguments</key><array>%s</array>'
+                            '<key>RunAtLoad</key><true/></dict></plist>\n' % args)
+            elif os.path.exists(path):
+                os.remove(path)
+        else:
+            path = _linux_desktop()
+            if enable:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write("[Desktop Entry]\nType=Application\nName=Live Ticker\nExec=%s\n"
+                            "X-GNOME-Autostart-enabled=true\n" % " ".join('"%s"' % c for c in cmd))
+            elif os.path.exists(path):
+                os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
 def work_area(root):
     """Usable screen rectangle (x0, y0, x1, y1), excluding the taskbar / menu bar."""
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -742,6 +831,10 @@ class TickerApp:
         m.add_cascade(label="Display", menu=dp)
 
         m.add_separator()
+        self.v_startup = tk.BooleanVar(value=startup_enabled())
+        m.add_checkbutton(label="Start automatically when I log in", variable=self.v_startup,
+                          command=self._toggle_startup)
+        m.add_separator()
         m.add_command(label="%s %s" % (APP_NAME, VERSION), state="disabled")
         m.add_command(label="Quit", command=self.quit)
         self.menu = m
@@ -794,6 +887,10 @@ class TickerApp:
         self.root.geometry("%dx%d+%d+%d" % (w, self.h, x, y))
         self._set("corner", corner)
         self.root.after(50, self._remember_pos)
+
+    def _toggle_startup(self):
+        if not set_startup(self.v_startup.get()):
+            self.v_startup.set(startup_enabled())
 
     def _toggle_league(self, k):
         self.cfg["enabled"][k] = self.v_leagues[k].get()
@@ -1164,6 +1261,12 @@ def main():
         if "--html" in sys.argv and sys.argv.index("--html") + 1 < len(sys.argv):
             path = sys.argv[sys.argv.index("--html") + 1]
         print_once(path)
+        return
+    if "--startup-on" in sys.argv or "--startup-off" in sys.argv:
+        on = "--startup-on" in sys.argv
+        ok = set_startup(on)
+        print(("Live Ticker will start automatically when you log in." if on else
+               "Live Ticker will no longer start automatically.") if ok else "Sorry, that didn't work.")
         return
     if "--version" in sys.argv:
         print(APP_NAME, VERSION)
