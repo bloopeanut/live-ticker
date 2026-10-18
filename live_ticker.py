@@ -4,7 +4,7 @@ Live Ticker - a tiny always-on-top sports score crawl, in the spirit of the
 ESPN BottomLine and the mid-2000s Yahoo! Sports ticker.
 
 * Shows ONLY games in progress (no finals, no upcoming games, no news).
-* Ordered by estimated time remaining, most time left first.
+* Grouped by sport, then ordered by time remaining, least time left first.
 * Every Division I college football (FBS + FCS) and college basketball game,
   plus pro and other college sports.
 * Polls fast (every few seconds) while games are live.
@@ -54,12 +54,12 @@ SOCCER = {"kind": "soccer"}
 LEAGUES = [
     # key       label       sport       path                                    groups    model                                            priority college color
     ("ncaaf",  "NCAAF",     "cfb",      "football/college-football",            [80, 81], clock(4, 15, 0, 3.1, {2: 20}),                   True,  True,  "#c8541b"),
-    ("ncaam",  "NCAAM",     "cbb",      "basketball/mens-college-basketball",   [50],     clock(2, 20, 5, 2.6, {1: 15}),                   True,  True,  "#1d5fbf"),
-    ("ncaaw",  "NCAAW",     "cbb",      "basketball/womens-college-basketball", [50],     clock(4, 10, 5, 2.6, {2: 15}),                   True,  True,  "#7b3fb5"),
+    ("ncaam",  "NCAAM",     "cbbm",      "basketball/mens-college-basketball",   [50],     clock(2, 20, 5, 2.6, {1: 15}),                   True,  True,  "#1d5fbf"),
+    ("ncaaw",  "NCAAW",     "cbbw",      "basketball/womens-college-basketball", [50],     clock(4, 10, 5, 2.6, {2: 15}),                   True,  True,  "#7b3fb5"),
     ("cbase",  "NCAA BSB",  "cbase",    "baseball/college-baseball",            None,     {"kind": "baseball", "innings": 9, "half": 10},  False, True,  "#1e5a32"),
     ("csoft",  "NCAA SB",   "csoft",    "baseball/college-softball",            None,     {"kind": "baseball", "innings": 7, "half": 7},   False, True,  "#2a7a46"),
-    ("mlax",   "NCAAM LAX", "clax",     "lacrosse/mens-college-lacrosse",       None,     clock(4, 15, 4, 2.0, {2: 10}),                   False, True,  "#5c4a9e"),
-    ("wlax",   "NCAAW LAX", "clax",     "lacrosse/womens-college-lacrosse",     None,     clock(4, 15, 3, 2.0, {2: 10}),                   False, True,  "#7a4a9e"),
+    ("mlax",   "NCAAM LAX", "claxm",     "lacrosse/mens-college-lacrosse",       None,     clock(4, 15, 4, 2.0, {2: 10}),                   False, True,  "#5c4a9e"),
+    ("wlax",   "NCAAW LAX", "claxw",     "lacrosse/womens-college-lacrosse",     None,     clock(4, 15, 3, 2.0, {2: 10}),                   False, True,  "#7a4a9e"),
     ("nfl",    "NFL",       "pfb",      "football/nfl",                         None,     clock(4, 15, 10, 2.9, {2: 13}),                  False, False, "#0a3a7a"),
     ("cfl",    "CFL",       "pfb",      "football/cfl",                         None,     clock(4, 15, 0, 2.7, {2: 15}),                   False, False, "#b5121b"),
     ("ufl",    "UFL",       "pfb",      "football/ufl",                         None,     clock(4, 15, 0, 2.9, {2: 13}),                   False, False, "#1b3f8f"),
@@ -81,13 +81,16 @@ LEAGUES = [
 ]
 
 # Sports, in the order they appear in the crawl. College and pro are separate
-# sports; men's and women's college basketball (and lacrosse) share a group.
+# sports, and men's and women's college games are separate groups (the group
+# name is only shown once, at the start of each group).
 SPORTS = [
     ("cfb",   "COLLEGE FOOTBALL"),
-    ("cbb",   "COLLEGE BASKETBALL"),
+    ("cbbm",  "MEN'S COLLEGE BASKETBALL"),
+    ("cbbw",  "WOMEN'S COLLEGE BASKETBALL"),
     ("cbase", "COLLEGE BASEBALL"),
     ("csoft", "COLLEGE SOFTBALL"),
-    ("clax",  "COLLEGE LACROSSE"),
+    ("claxm", "MEN'S COLLEGE LACROSSE"),
+    ("claxw", "WOMEN'S COLLEGE LACROSSE"),
     ("pfb",   "PRO FOOTBALL"),
     ("pbb",   "PRO BASKETBALL"),
     ("mlb",   "MLB"),
@@ -106,14 +109,16 @@ for _i, _row in enumerate(LEAGUES):
                   "color": _color, "order": _i}
 
 DEFAULTS = {
-    "x": None, "y": None, "width": None,
+    "layout": 2,                 # bump to reset saved window position/size
+    "corner": "top-right",       # default dock corner
+    "x": None, "y": None, "width": 420,
     "font_size": 11,
     "speed": 70,                 # pixels per second
     "pause_on_hover": True,
     "topmost": True,
     "opacity": 1.0,
     "name_style": "short",       # "short" (Ohio State) or "abbr" (OSU)
-    "show_situation": True,      # down & distance, outs/runners
+    "show_situation": True,      # baseball/softball outs and runners
     "fast_poll": 3,              # seconds, college football/basketball while live
     "live_poll": 6,              # seconds, everything else while live
     "bypass_cache": True,        # ask ESPN's CDN for a fresh copy every poll
@@ -126,6 +131,9 @@ def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             saved = json.load(f)
+        if saved.get("layout") != DEFAULTS["layout"]:   # old full-width layout
+            for k in ("x", "y", "width", "layout", "corner"):
+                saved.pop(k, None)
         for k, v in saved.items():
             if k == "enabled" and isinstance(v, dict):
                 cfg["enabled"].update({kk: bool(vv) for kk, vv in v.items() if kk in LEAGUE})
@@ -325,12 +333,7 @@ def parse_live_event(ev, lg):
     model = lg["model"]
 
     extra, poss, redzone = "", None, False
-    if lg["path"].startswith("football/"):
-        poss = str(sit.get("possession")) if sit.get("possession") else None
-        redzone = bool(sit.get("isRedZone"))
-        if "HALFTIME" not in stype.get("name", ""):
-            extra = sit.get("downDistanceText") or sit.get("shortDownDistanceText") or ""
-    elif model["kind"] == "baseball":
+    if model["kind"] == "baseball":
         bits = []
         if sit.get("outs") is not None:
             o = int(_num(sit.get("outs")))
@@ -366,10 +369,16 @@ def parse_live_event(ev, lg):
 # Data hub: schedules polls per feed, merges results
 # --------------------------------------------------------------------------
 
+def fmt_time(ts):
+    if not ts:
+        return "--:--"
+    return datetime.fromtimestamp(ts).strftime("%I:%M:%S %p").lstrip("0")
+
+
 def sort_key(g):
-    """Sport first (crawl order above), then most time remaining first."""
+    """Sport first (crawl order above), then least time remaining first."""
     lg = LEAGUE[g["league"]]
-    return (SPORT_ORDER[lg["sport"]], -round(g["remaining"], 1), lg["order"], g["id"])
+    return (SPORT_ORDER[lg["sport"]], round(g["remaining"], 1), lg["order"], g["id"])
 
 
 class Feed:
@@ -482,6 +491,11 @@ class DataHub:
         games = sorted(merged.values(), key=sort_key)
         return version, games
 
+    def last_refresh(self):
+        """Wall time of the most recent successful fetch (None if none yet)."""
+        oks = [f.last_ok for f in self.feeds if f.last_ok]
+        return max(oks) if oks else None
+
     def freshness(self):
         """Age (s) of the stalest feed that currently has live games, else of newest fetch."""
         now = time.time()
@@ -503,6 +517,23 @@ BG_PANEL = "#000000"
 FG = "#ffffff"
 NAME_FG = SCORE_FG = RANK_FG = STATUS_FG = DIM_FG = POSS_FG = REDZONE_FG = FG
 SEP_FG = "#444444"
+
+
+def work_area(root):
+    """Usable screen rectangle (x0, y0, x1, y1), excluding the taskbar / menu bar."""
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):  # SPI_GETWORKAREA
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        return 0, 25, sw, sh
+    return 0, 0, sw, sh
 
 
 class Card:
@@ -540,11 +571,12 @@ class TickerApp:
         self.h = self.f_name.metrics("linespace") + 14
 
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w = int(self.cfg["width"] or sw)
-        x = self.cfg["x"] if self.cfg["x"] is not None else 0
-        y = self.cfg["y"] if self.cfg["y"] is not None else sh - self.h - (60 if sys.platform == "win32" else 90)
-        x = max(-w + 100, min(int(x), sw - 100))
-        y = max(0, min(int(y), sh - self.h))
+        w = int(self.cfg["width"] or 420)
+        if self.cfg["x"] is None or self.cfg["y"] is None:
+            x, y = self._corner_xy(self.cfg.get("corner", "top-right"), w)
+        else:
+            x = max(-w + 100, min(int(self.cfg["x"]), sw - 100))
+            y = max(0, min(int(self.cfg["y"]), sh - self.h))
         self.root.geometry("%dx%d+%d+%d" % (w, self.h, x, y))
         self._apply_window_attrs()
 
@@ -571,6 +603,7 @@ class TickerApp:
         self._save_job = None
         self.started = False
         self.tail_sport = None
+        self.need_marker = True
         self.t_start = time.monotonic()
 
         self._bind()
@@ -616,10 +649,13 @@ class TickerApp:
         self.dot_item = L.create_oval(0, 0, 0, 0, fill="#666", outline="")
         self._layout_left()
 
-        self.menu_btn = R.create_text(12, ymid, anchor="w", text="⋮", font=self.f_score, fill=DIM_FG)
-        bx = R.bbox(self.menu_btn)[2] + 10
-        self.close_btn = R.create_text(bx, ymid, anchor="w", text="✕", font=self.f_small, fill=DIM_FG)
-        R.config(width=R.bbox(self.close_btn)[2] + 10)
+        # Two click zones: [ ≡ | × ]. Clicks are handled in _release, by position.
+        # Drawn with lines rather than font glyphs so they look the same everywhere.
+        for dy in (-5, 0, 5):                                   # menu: three bars
+            R.create_line(8, ymid + dy, 22, ymid + dy, fill=FG, width=2)
+        R.create_line(36, ymid - 5, 46, ymid + 5, fill=FG, width=2)   # close: an X
+        R.create_line(36, ymid + 5, 46, ymid - 5, fill=FG, width=2)
+        R.config(width=56)
 
     def _layout_left(self):
         L, ymid = self.left, self.h // 2
@@ -642,8 +678,6 @@ class TickerApp:
         self.canvas.bind("<MouseWheel>", self._wheel)
         self.canvas.bind("<Button-4>", lambda e: self._set_speed(self.cfg["speed"] + 10))
         self.canvas.bind("<Button-5>", lambda e: self._set_speed(self.cfg["speed"] - 10))
-        self.right.tag_bind(self.menu_btn, "<ButtonRelease-1>", self._popup)
-        self.right.tag_bind(self.close_btn, "<ButtonRelease-1>", lambda e: self.quit())
         self.right.bind("<Motion>", self._edge_cursor)
 
     def _build_menu(self):
@@ -668,11 +702,13 @@ class TickerApp:
         m.add_cascade(label="Text size", menu=sz)
 
         wd = tk.Menu(m, tearoff=0)
-        wd.add_command(label="Full width, bottom of screen", command=lambda: self._dock("bottom"))
-        wd.add_command(label="Full width, top of screen", command=lambda: self._dock("top"))
-        for px in (1600, 1200, 900, 600):
+        for label, corner in (("Upper right corner", "top-right"), ("Upper left corner", "top-left"),
+                              ("Lower right corner", "bottom-right"), ("Lower left corner", "bottom-left")):
+            wd.add_command(label=label, command=lambda c=corner: self._dock(c))
+        wd.add_separator()
+        for px in (300, 420, 600, 800):
             wd.add_command(label="%d px wide" % px, command=lambda px=px: self._set_width(px))
-        m.add_cascade(label="Width / position", menu=wd)
+        m.add_cascade(label="Position / width", menu=wd)
 
         lg = tk.Menu(m, tearoff=0)
         self.v_leagues = {}
@@ -691,7 +727,7 @@ class TickerApp:
         dp.add_radiobutton(label="Abbreviations (OSU)", variable=self.v_names, value="abbr", command=self._names)
         dp.add_separator()
         self.v_sit = tk.BooleanVar(value=self.cfg["show_situation"])
-        dp.add_checkbutton(label="Show down & distance / outs", variable=self.v_sit, command=self._situation)
+        dp.add_checkbutton(label="Show outs & runners (baseball/softball)", variable=self.v_sit, command=self._situation)
         self.v_hover = tk.BooleanVar(value=self.cfg["pause_on_hover"])
         dp.add_checkbutton(label="Pause while mouse is over ticker", variable=self.v_hover,
                            command=lambda: self._set("pause_on_hover", self.v_hover.get()))
@@ -737,16 +773,26 @@ class TickerApp:
         self._build_panels()
         self._reset_crawl()
 
-    def _set_width(self, px):
-        self._set("width", px)
-        self.root.geometry("%dx%d" % (px, self.h))
-        self._remember_pos()
+    def _corner_xy(self, corner, w):
+        x0, y0, x1, y1 = work_area(self.root)
+        x = x1 - w if corner.endswith("right") else x0
+        y = y0 if corner.startswith("top") else y1 - self.h
+        return x, y
 
-    def _dock(self, where):
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        y = 0 if where == "top" else sh - self.h - (48 if sys.platform == "win32" else 0)
-        self.root.geometry("%dx%d+0+%d" % (sw, self.h, y))
-        self._set("width", sw)
+    def _set_width(self, px):
+        # Keep the bar's right edge where it is if it's docked on the right.
+        x0, _, x1, _ = work_area(self.root)
+        right_docked = self.root.winfo_x() + self.root.winfo_width() >= x1 - 2
+        x = x1 - px if right_docked else self.root.winfo_x()
+        self._set("width", px)
+        self.root.geometry("%dx%d+%d+%d" % (px, self.h, x, self.root.winfo_y()))
+        self.root.after(50, self._remember_pos)
+
+    def _dock(self, corner):
+        w = self.root.winfo_width()
+        x, y = self._corner_xy(corner, w)
+        self.root.geometry("%dx%d+%d+%d" % (w, self.h, x, y))
+        self._set("corner", corner)
         self.root.after(50, self._remember_pos)
 
     def _toggle_league(self, k):
@@ -790,10 +836,11 @@ class TickerApp:
             self.menu.grab_release()
 
     def _edge_cursor(self, e):
-        self.right.config(cursor="sb_h_double_arrow" if e.x >= int(self.right["width"]) - 6 else "")
+        rw = int(self.right["width"])
+        self.right.config(cursor="sb_h_double_arrow" if e.x >= rw - 4 else "hand2")
 
     def _press(self, e):
-        resize = e.widget is self.right and e.x >= int(self.right["width"]) - 6
+        resize = e.widget is self.right and e.x >= int(self.right["width"]) - 4
         self.drag = ("resize" if resize else "move", e.x_root, e.y_root,
                      self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
 
@@ -807,11 +854,21 @@ class TickerApp:
             self.root.geometry("%dx%d" % (max(300, ww + e.x_root - x0), self.h))
 
     def _release(self, e):
-        if self.drag:
-            if self.drag[0] == "resize":
-                self._set("width", self.root.winfo_width())
+        d, self.drag = self.drag, None
+        if not d:
+            return
+        moved = abs(e.x_root - d[1]) + abs(e.y_root - d[2]) > 4
+        if d[0] == "resize":
+            self._set("width", self.root.winfo_width())
+        elif not moved and e.widget is self.right:
+            # A click (not a drag) on the button panel: left half = menu, right half = close.
+            if e.x < int(self.right["width"]) // 2:
+                self._popup(e)
+            else:
+                self.quit()
+            return
+        if moved:
             self._remember_pos()
-        self.drag = None
 
     def _remember_pos(self):
         self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
@@ -856,37 +913,31 @@ class TickerApp:
 
     # ---- card rendering ----------------------------------------------------
     def _segments(self, g):
-        lg = LEAGUE[g["league"]]
-        segs = [("pill", lg["label"], lg["color"])]
+        segs = []
         style = self.cfg["name_style"]
         for side in ("away", "home"):
             t = g[side]
             if t["rank"]:
-                segs.append(("small", str(t["rank"]), RANK_FG, 3))
+                segs.append(("small", "#%d" % t["rank"], RANK_FG, 3))
             segs.append(("name", t["abbr"] if style == "abbr" else t["short"], NAME_FG, 6))
-            if g["poss"] and g["poss"] == t["id"]:
-                segs.append(("small", "●", REDZONE_FG if g["redzone"] else POSS_FG, 5))
             gap = 5 if t["set_pts"] is not None else 16
             segs.append(("score", t["score"], SCORE_FG, gap))
             if t["set_pts"] is not None:
                 segs.append(("small", "(%d)" % t["set_pts"], DIM_FG, 16))
         segs.append(("status", g["status"], STATUS_FG, 8))
         if g["extra"] and self.cfg["show_situation"]:
-            segs.append(("small", g["extra"], REDZONE_FG if g["redzone"] else DIM_FG, 0))
+            segs.append(("small", g["extra"], DIM_FG, 0))
         return segs
 
     def _header_segments(self, sport):
-        n = sum(1 for g in self.games if LEAGUE[g["league"]]["sport"] == sport)
-        return [("name", SPORT_LABEL[sport], SCORE_FG, 8), ("small", "%d live" % n, DIM_FG, 0)]
+        return [("pill", SPORT_LABEL[sport], None)]
 
     def _marker_segments(self):
-        n = len(self.games)
-        stamp = datetime.now().strftime("%I:%M %p").lstrip("0")
-        if n:
-            txt = "%d game%s in progress" % (n, "" if n == 1 else "s")
-            return [("pill", "IN PROGRESS", None), ("name", txt, NAME_FG, 10), ("small", stamp, DIM_FG, 0)]
-        return [("pill", "LIVE", None), ("name", "No games in progress", NAME_FG, 10),
-                ("small", "checking %d leagues · %s" % (sum(self.cfg["enabled"].values()), stamp), DIM_FG, 0)]
+        """Start of every loop: time of the last data refresh."""
+        segs = [("name", "Updated " + fmt_time(self.hub.last_refresh()), NAME_FG, 10)]
+        if not self.games:
+            segs.append(("small", "No games in progress", DIM_FG, 0))
+        return segs
 
     def _draw(self, x, gid):
         cv, ymid = self.canvas, self.h // 2
@@ -937,7 +988,8 @@ class TickerApp:
 
     def _next_gid(self):
         games = self.games
-        if not games:
+        if self.need_marker or not games:
+            self.need_marker = False
             self.cursor = None
             return self.MARKER
         if self.cursor is None:
@@ -949,7 +1001,7 @@ class TickerApp:
                 nxt = idx + 1
             else:   # cursor game ended: resume at the next game in sort order
                 nxt = next((i for i, g in enumerate(games) if sort_key(g) > key), len(games))
-        if nxt >= len(games):
+        if nxt >= len(games):          # end of loop: next loop starts with the marker
             self.cursor = None
             return self.MARKER
         g = games[nxt]
@@ -961,6 +1013,7 @@ class TickerApp:
         self.cards = []
         self.cursor = None
         self.tail_sport = None
+        self.need_marker = True
 
     def _frame(self):
         now = time.perf_counter()
@@ -1010,10 +1063,13 @@ class TickerApp:
 
     # ---- lifecycle ---------------------------------------------------------
     def quit(self):
-        self._remember_pos()
-        save_config(self.cfg)
-        self.hub.stop()
-        self.root.destroy()
+        try:
+            self._remember_pos()
+            save_config(self.cfg)
+            self.hub.stop()
+            self.root.destroy()
+        finally:
+            os._exit(0)   # don't wait for any in-flight network request
 
     def run(self):
         self.root.mainloop()
@@ -1023,34 +1079,91 @@ class TickerApp:
 # Command line
 # --------------------------------------------------------------------------
 
-def print_once():
-    """Fetch every league once and print the live list (no window)."""
+def _team_label(t):
+    return ("#%d " % t["rank"] if t["rank"] else "") + t["short"]
+
+
+def write_html(path, games, updated):
+    """Save the --once results as a simple, self-contained HTML page."""
+    import html
+    esc = html.escape
+    rows, sport = [], None
+    for g in games:
+        sp = LEAGUE[g["league"]]["sport"]
+        if sp != sport:
+            sport = sp
+            rows.append('<tr class="group"><th colspan="5">%s</th></tr>' % esc(SPORT_LABEL[sp]))
+        a, h = g["away"], g["home"]
+        status = g["status"] + (" \u00b7 " + g["extra"] if g["extra"] else "")
+        rows.append(
+            '<tr><td class="team">%s</td><td class="score">%s</td>'
+            '<td class="team">%s</td><td class="score">%s</td><td class="status">%s</td></tr>'
+            % (esc(_team_label(a)), esc(a["score"]), esc(_team_label(h)), esc(h["score"]), esc(status)))
+    if not rows:
+        rows.append('<tr><td colspan="5" class="none">No games in progress</td></tr>')
+    stamp = datetime.fromtimestamp(updated).strftime("%A, %B %d, %Y \u00b7 %I:%M:%S %p") if updated else "never"
+    page = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Scores</title>
+<style>
+  body {{ background:#000; color:#fff; font:15px/1.4 "Segoe UI", -apple-system, Helvetica, Arial, sans-serif; margin:24px; }}
+  h1 {{ font-size:20px; margin:0 0 4px; }}
+  .updated {{ color:#bbb; margin:0 0 18px; }}
+  table {{ border-collapse:collapse; }}
+  td, th {{ padding:4px 14px 4px 0; text-align:left; white-space:nowrap; }}
+  tr.group th {{ padding-top:16px; border-bottom:1px solid #444; letter-spacing:.04em; font-size:13px; }}
+  td.score {{ font-weight:700; text-align:right; padding-right:22px; font-variant-numeric:tabular-nums; }}
+  td.status {{ color:#bbb; }}
+  td.none {{ color:#bbb; padding-top:12px; }}
+</style></head>
+<body>
+<h1>Live Scores</h1>
+<p class="updated">Updated {stamp} &middot; {count} game{plural} in progress</p>
+<table>
+{rows}
+</table>
+</body></html>
+""".format(stamp=esc(stamp.replace(" 0", " ")), count=len(games), plural="" if len(games) == 1 else "s",
+           rows="\n".join(rows))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+
+
+def print_once(html_path="live_scores.html"):
+    """Fetch every league once, print the live list, and save it as an HTML page."""
     cfg = load_config()
     hub = DataHub(cfg)
     feeds = [f for f in hub.feeds if cfg["enabled"].get(f.lg["key"], True)]
-    t0 = time.time()
     list(ThreadPoolExecutor(8).map(hub._run, feeds))
     _, games = hub.snapshot()
-    print("%d games in progress (fetched %d feeds in %.1fs)\n" % (len(games), len(feeds), time.time() - t0))
+    updated = hub.last_refresh()
+    print("Updated %s  -  %d game%s in progress" % (fmt_time(updated), len(games), "" if len(games) == 1 else "s"))
     sport = None
     for g in games:
         if LEAGUE[g["league"]]["sport"] != sport:
             sport = LEAGUE[g["league"]]["sport"]
-            print("\n== %s" % SPORT_LABEL[sport])
+            print("\n%s" % SPORT_LABEL[sport])
         a, h = g["away"], g["home"]
-        print("%-10s %5.0f min  %-22s %3s  %-22s %3s  %-12s %s" % (
-            LEAGUE[g["league"]]["label"], g["remaining"],
-            ("#%d " % a["rank"] if a["rank"] else "") + a["short"], a["score"],
-            ("#%d " % h["rank"] if h["rank"] else "") + h["short"], h["score"],
-            g["status"], g["extra"]))
+        line = "  %-26s %3s   %-26s %3s   %s" % (_team_label(a), a["score"], _team_label(h), h["score"], g["status"])
+        if g["extra"]:
+            line += "  (%s)" % g["extra"]
+        print(line)
+    if not games:
+        print("\nNo games in progress.")
     errs = [f.key for f in feeds if f.errors]
     if errs:
-        print("\nfeeds with errors:", ", ".join(errs))
+        print("\n(could not reach: %s)" % ", ".join(errs))
+    write_html(html_path, games, updated)
+    print("\nSaved %s" % os.path.abspath(html_path))
 
 
 def main():
     if "--once" in sys.argv:
-        print_once()
+        path = "live_scores.html"
+        if "--html" in sys.argv and sys.argv.index("--html") + 1 < len(sys.argv):
+            path = sys.argv[sys.argv.index("--html") + 1]
+        print_once(path)
         return
     if "--version" in sys.argv:
         print(APP_NAME, VERSION)

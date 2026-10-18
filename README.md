@@ -1,9 +1,10 @@
 # Live Ticker
 
-A small, always-on-top score crawl for your desktop, in the spirit of the ESPN BottomLine and the old Yahoo! Sports ticker.
+A small, always-on-top score crawl that sits in a corner of your screen (upper right by default), in the spirit of the old My Yahoo! desktop ticker. Plain white text on black; the only motion is the scroll.
 
 - **Only games in progress.** No finals, no upcoming games, no news.
-- **Grouped by sport, then by time remaining.** College and pro count as separate sports, and each sport gets a header in the crawl (e.g. COLLEGE FOOTBALL · 24 live). Within a sport, the game with the most time left comes first. Sport order: college football, college basketball (men's and women's together), college baseball, college softball, college lacrosse, then pro football (NFL/CFL/UFL), pro basketball (NBA/WNBA), MLB, NHL, soccer, pro lacrosse.
+- **Grouped by sport, then by time remaining.** College and pro count as separate sports, as do men's and women's college games. The group name (e.g. COLLEGE FOOTBALL) appears once at the start of its group. Within a group, the game closest to ending comes first. Order: college football, men's and women's college basketball, college baseball, college softball, men's and women's college lacrosse, then pro football (NFL/CFL/UFL), pro basketball (NBA/WNBA), MLB, NHL, soccer, pro lacrosse.
+- **Each loop starts with the time of the last refresh**, e.g. "Updated 11:17:18 PM".
 - **Every Division I college football game** (FBS and FCS) and **every Division I men's and women's college basketball game**, not just the Top 25. AP rankings appear next to ranked teams. College baseball, softball and men's/women's lacrosse are included too.
 - **Pro leagues:** NFL, CFL, UFL, NBA, WNBA, MLB, NHL, PLL, MLS, NWSL, the big European soccer leagues, Champions/Europa League and Liga MX.
 - **Near real time.** College football and basketball are polled every 3 seconds while games are live, everything else every 6 seconds, and the app asks ESPN's CDN for a fresh copy each time rather than an up-to-8-second-old cached one. Leagues with nothing live are checked less often until a game is about to start.
@@ -19,7 +20,7 @@ On macOS the app isn't signed, so the first time right-click it and choose **Ope
 python live_ticker.py
 ```
 
-`python live_ticker.py --once` prints the current live list to the terminal without opening a window, which is handy for checking that the feeds are working.
+`python live_ticker.py --once` prints the current live list to the terminal (with the refresh time at the top) without opening a window, and also saves it as a web page, `live_scores.html`, in the current folder. Use `--once --html some/other/name.html` to save it somewhere else.
 
 ## Using it
 
@@ -30,12 +31,12 @@ python live_ticker.py
 | Hover over the crawl | Pause it so you can read |
 | Double-click a game | Open that game on ESPN |
 | Scroll wheel | Speed up / slow down |
-| Right-click, or the ≡ button | Settings menu |
-| × button | Quit |
+| Right-click, or the ≡ button at the right end | Settings menu |
+| × button at the right end | Quit |
 
-The settings menu has scroll speed, text size, width and docking (full width at the top or bottom of the screen), league on/off switches (including a "college football + basketball only" shortcut), team names vs. abbreviations, down-and-distance on/off, always-on-top, and opacity. Settings and window position are saved to `~/.live_ticker.json`.
+The settings menu has scroll speed, text size, position (any of the four screen corners) and width, league on/off switches (including a "college football + basketball only" shortcut), team names vs. abbreviations, baseball outs/runners on/off, always-on-top, and opacity. Settings and window position are saved to `~/.live_ticker.json`.
 
-**Reading the bar:** plain white text on black. The dot after the live count is lit while data is fresh (updated in the last 20 seconds) and goes dark if updates stall. In football, a dot next to a team marks possession.
+**Reading the bar:** the number after LIVE is how many games are in progress. The dot after it is lit while data is fresh (updated in the last 20 seconds) and goes dark if updates stall. A number like #12 before a team is its AP ranking.
 
 ## How "time remaining" is estimated
 
