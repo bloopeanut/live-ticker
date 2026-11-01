@@ -7,6 +7,7 @@ A small, always-on-top score crawl that sits in a corner of your screen (upper r
 - **Each loop starts with the time of the last refresh**, e.g. "Updated 11:17:18 PM".
 - **Every Division I college football game** (FBS and FCS) and **every Division I men's and women's college basketball game**, not just the Top 25. AP rankings appear next to ranked teams. College baseball, softball, men's/women's lacrosse and men's hockey are included too.
 - **Pro leagues:** NFL, CFL, UFL, NBA, WNBA, MLB, NHL, PLL, MLS, NWSL, the big European soccer leagues, Champions/Europa League and Liga MX.
+- **US pro teams are shown by city** (Boston, not Celtics). Where a city has more than one team in the same league, the team name is used instead: Giants/Jets, Chargers/Rams, Yankees/Mets, Cubs/White Sox, Rangers/Islanders, Clippers/Lakers. The list of shared cities is checked against ESPN's team lists each time the app starts, so relocations are picked up automatically.
 - **Near real time.** College football and basketball are polled every 3 seconds while games are live, everything else every 6 seconds, and the app asks ESPN's CDN for a fresh copy each time rather than an up-to-8-second-old cached one. Leagues with nothing live are checked less often until a game is about to start.
 
 ## Run it

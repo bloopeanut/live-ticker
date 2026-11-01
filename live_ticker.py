@@ -195,6 +195,52 @@ def fetch_json(url, timeout=8):
 # Parsing + time-remaining estimates
 # --------------------------------------------------------------------------
 
+# US pro leagues show the city ("Boston"), except where a city has more than
+# one team in that league; those teams show the team name ("Giants", "Jets").
+CITY_LEAGUES = {"nfl", "ufl", "nba", "wnba", "mlb", "nhl", "pll"}
+# Cities shared by 2+ teams in a league. Refreshed from ESPN's team lists at
+# startup; these defaults cover the current leagues if that lookup fails.
+SHARED_CITIES = {
+    "nfl": {"los angeles", "new york"},
+    "mlb": {"chicago", "los angeles", "new york"},
+    "nhl": {"new york"},
+    "nba": {"los angeles"},          # Clippers ("LA") and Lakers
+}
+_CITY_ALIASES = {"la": "los angeles", "ny": "new york"}
+
+
+def _city_key(loc):
+    k = (loc or "").strip().lower()
+    return _CITY_ALIASES.get(k, k)
+
+
+def display_name(league, t):
+    """Name shown for a team (in 'team names' mode)."""
+    if league in CITY_LEAGUES and t.get("city") and t.get("team"):
+        if _city_key(t["city"]) in SHARED_CITIES.get(league, set()):
+            return t["team"]
+        return "Los Angeles" if _city_key(t["city"]) == "los angeles" else t["city"]
+    return t["short"]
+
+
+def refresh_shared_cities():
+    """Rebuild SHARED_CITIES from ESPN's current team lists (runs in background)."""
+    for key in CITY_LEAGUES:
+        try:
+            data = fetch_json("%s/%s/teams?limit=200" % (API, LEAGUE[key]["path"]))
+            teams = data["sports"][0]["leagues"][0]["teams"]
+            counts = {}
+            for item in teams:
+                tm = item.get("team") or {}
+                if tm.get("location") and tm.get("name"):     # skip all-star / placeholder teams
+                    c = _city_key(tm["location"])
+                    counts[c] = counts.get(c, 0) + 1
+            if counts:
+                SHARED_CITIES[key] = {c for c, n in counts.items() if n > 1}
+        except Exception:
+            pass
+
+
 def _num(v, default=0.0):
     try:
         return float(v)
@@ -323,6 +369,8 @@ def parse_live_event(ev, lg):
             "id": str(tm.get("id", "")),
             "abbr": tm.get("abbreviation") or tm.get("shortDisplayName") or "?",
             "short": tm.get("shortDisplayName") or tm.get("name") or tm.get("abbreviation") or "?",
+            "city": tm.get("location") or "",
+            "team": tm.get("name") or "",
             "score": str(c.get("score", "0") if c.get("score") not in (None, "") else "0"),
             "rank": rank if isinstance(rank, int) and 1 <= rank <= 25 else None,
             "set_pts": int(_num(lines[-1])) if lines and lg["model"]["kind"] == "sets" else None,
@@ -416,6 +464,7 @@ class DataHub:
         self.pool = ThreadPoolExecutor(max_workers=8)
 
     def start(self):
+        threading.Thread(target=refresh_shared_cities, daemon=True).start()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
@@ -812,7 +861,7 @@ class TickerApp:
 
         dp = tk.Menu(m, tearoff=0)
         self.v_names = tk.StringVar(value=self.cfg["name_style"])
-        dp.add_radiobutton(label="Team names (Ohio State)", variable=self.v_names, value="short", command=self._names)
+        dp.add_radiobutton(label="Names (Ohio State, Boston)", variable=self.v_names, value="short", command=self._names)
         dp.add_radiobutton(label="Abbreviations (OSU)", variable=self.v_names, value="abbr", command=self._names)
         dp.add_separator()
         self.v_sit = tk.BooleanVar(value=self.cfg["show_situation"])
@@ -1016,7 +1065,7 @@ class TickerApp:
             t = g[side]
             if t["rank"]:
                 segs.append(("small", "#%d" % t["rank"], RANK_FG, 3))
-            segs.append(("name", t["abbr"] if style == "abbr" else t["short"], NAME_FG, 6))
+            segs.append(("name", t["abbr"] if style == "abbr" else display_name(g["league"], t), NAME_FG, 6))
             gap = 5 if t["set_pts"] is not None else 16
             segs.append(("score", t["score"], SCORE_FG, gap))
             if t["set_pts"] is not None:
@@ -1176,8 +1225,9 @@ class TickerApp:
 # Command line
 # --------------------------------------------------------------------------
 
-def _team_label(t):
-    return ("#%d " % t["rank"] if t["rank"] else "") + t["short"]
+def _team_label(g, side):
+    t = g[side]
+    return ("#%d " % t["rank"] if t["rank"] else "") + display_name(g["league"], t)
 
 
 def write_html(path, games, updated):
@@ -1195,7 +1245,7 @@ def write_html(path, games, updated):
         rows.append(
             '<tr><td class="team">%s</td><td class="score">%s</td>'
             '<td class="team">%s</td><td class="score">%s</td><td class="status">%s</td></tr>'
-            % (esc(_team_label(a)), esc(a["score"]), esc(_team_label(h)), esc(h["score"]), esc(status)))
+            % (esc(_team_label(g, "away")), esc(a["score"]), esc(_team_label(g, "home")), esc(h["score"]), esc(status)))
     if not rows:
         rows.append('<tr><td colspan="5" class="none">No games in progress</td></tr>')
     stamp = datetime.fromtimestamp(updated).strftime("%A, %B %d, %Y \u00b7 %I:%M:%S %p") if updated else "never"
@@ -1232,7 +1282,10 @@ def print_once(html_path="live_scores.html"):
     cfg = load_config()
     hub = DataHub(cfg)
     feeds = [f for f in hub.feeds if cfg["enabled"].get(f.lg["key"], True)]
-    list(ThreadPoolExecutor(8).map(hub._run, feeds))
+    pool = ThreadPoolExecutor(8)
+    cities = pool.submit(refresh_shared_cities)
+    list(pool.map(hub._run, feeds))
+    cities.result()
     _, games = hub.snapshot()
     updated = hub.last_refresh()
     print("Updated %s  -  %d game%s in progress" % (fmt_time(updated), len(games), "" if len(games) == 1 else "s"))
@@ -1242,7 +1295,7 @@ def print_once(html_path="live_scores.html"):
             sport = LEAGUE[g["league"]]["sport"]
             print("\n%s" % SPORT_LABEL[sport])
         a, h = g["away"], g["home"]
-        line = "  %-26s %3s   %-26s %3s   %s" % (_team_label(a), a["score"], _team_label(h), h["score"], g["status"])
+        line = "  %-26s %3s   %-26s %3s   %s" % (_team_label(g, "away"), a["score"], _team_label(g, "home"), h["score"], g["status"])
         if g["extra"]:
             line += "  (%s)" % g["extra"]
         print(line)
