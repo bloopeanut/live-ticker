@@ -124,6 +124,7 @@ DEFAULTS = {
     "fast_poll": 3,              # seconds, college football/basketball while live
     "live_poll": 6,              # seconds, everything else while live
     "bypass_cache": True,        # ask ESPN's CDN for a fresh copy every poll
+    "show_tv": True,             # TV / streaming channel after each score
     "enabled": {k: True for k in LEAGUE},
 }
 
@@ -374,6 +375,7 @@ def parse_live_event(ev, lg):
             "score": str(c.get("score", "0") if c.get("score") not in (None, "") else "0"),
             "rank": rank if isinstance(rank, int) and 1 <= rank <= 25 else None,
             "set_pts": int(_num(lines[-1])) if lines and lg["model"]["kind"] == "sets" else None,
+            "aliases": team_aliases(tm) if lg["key"] in TV_GUIDE_SPORTS else None,
         }
     if "home" not in sides or "away" not in sides:
         return None
@@ -395,6 +397,11 @@ def parse_live_event(ev, lg):
             bits.append("on " + ", ".join(bases))
         extra = " · ".join(bits)
 
+    try:
+        start = datetime.strptime(ev.get("date", "")[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        start = None
+
     link = ""
     for ln in ev.get("links") or []:
         if ln.get("href", "").startswith("http"):
@@ -412,6 +419,8 @@ def parse_live_event(ev, lg):
         "redzone": redzone,
         "link": link,
         "remaining": remaining_minutes(model, st, home, away, sit, short_detail),
+        "start": start,
+        "espn_tv": espn_channels(comp),
     }
 
 
@@ -459,6 +468,182 @@ def scoreboard_dates():
     return [d.strftime("%Y%m%d") for d in days]
 
 
+# --------------------------------------------------------------------------
+# TV / streaming channels
+# --------------------------------------------------------------------------
+# College football and men's basketball channels come from Matt Sarzyniak's
+# "College Sports on TV" (mattsarzsports.com), which is more complete for
+# small-conference streams. Everything else uses ESPN's own broadcast list.
+TV_GUIDE_SPORTS = {"ncaaf": "football", "ncaam": "basketball"}
+TV_GUIDE_API = "https://api.mattsarzsports.com/graphql"
+TV_GUIDE_QUERY = ("query dailyTvGames($input: DailyTvGamesInput) { dailyTvGames(input: $input) "
+                  "{ tvGames { visitingTeam homeTeam network timeWithOffset } } }")
+TV_GUIDE_REFRESH = 15 * 60       # seconds; the schedule rarely changes during the day
+
+
+def espn_channels(comp):
+    """Channel text from ESPN: national outlets if any, else the teams' regional ones."""
+    geo = comp.get("geoBroadcasts") or []
+    pick = lambda market: [g["media"]["shortName"] for g in geo
+                           if (g.get("market") or {}).get("type") == market and (g.get("media") or {}).get("shortName")]
+    names = pick("National") or (pick("Home") + pick("Away"))
+    if not names:
+        names = [n for b in comp.get("broadcasts") or [] for n in b.get("names") or []]
+    out = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return " / ".join(out[:2])
+
+
+def _tnorm(s):
+    s = (s or "").lower().replace("&", " and ")
+    for a, b in (("\u00e9", "e"), ("\u00f1", "n"), ("'", ""), ("\u2019", "")):
+        s = s.replace(a, b)
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
+
+
+def _exact_keys(name):
+    n = _tnorm(name)
+    out, w = {n}, n.split()
+    for i, x in enumerate(w):
+        if x == "st":                                   # St. = State or Saint
+            for r in ("state", "saint"):
+                out.add(" ".join(w[:i] + [r] + w[i + 1:]))
+    return {v.replace(" ", "") for v in out if v}
+
+
+_LOOSE_DROP = {"state", "st", "university", "univ", "u", "the", "of", "college", "west", "point"}
+
+
+def _loose_keys(name):
+    words = _tnorm(re.sub(r"\([^)]*\)", " ", name or "")).split()
+    k = "".join(x for x in words if x not in _LOOSE_DROP)
+    out = {k} if len(k) >= 3 else set()
+    if len(words) >= 2:                                  # initials: "UT Rio Grande Valley" -> utrgv
+        out.add("".join(x if len(x) <= 2 else x[0] for x in words))
+    return out
+
+
+def team_aliases(tm):
+    names = {tm.get(k) for k in ("location", "shortDisplayName", "displayName", "abbreviation", "nickname")}
+    if tm.get("displayName") and tm.get("name") and tm["displayName"].endswith(tm["name"]):
+        names.add(tm["displayName"][: -len(tm["name"])].strip())
+    exact, loose = set(), set()
+    for n in names:
+        if n:
+            exact |= _exact_keys(n)
+            loose |= _loose_keys(n)
+    return (exact, loose)
+
+
+def _team_score(name, sides):
+    """2 = exact name match with a team in the game, 1 = loose match, 0 = none."""
+    ex, lo = _exact_keys(name), _loose_keys(name)
+    if any(ex & s[0] for s in sides):
+        return 2
+    for s in sides:
+        if lo & s[1]:
+            return 1
+        if any(len(a) >= 10 and len(b) >= 10 and (a.endswith(b) or b.endswith(a))
+               for a in lo for b in s[1]):               # "A&M-Kingsville" vs "Texas A&M-Kingsville"
+            return 1
+    return 0
+
+
+class TvGuide:
+    """Fetches and matches the mattsarzsports.com daily schedules."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.entries = {}          # sport -> [(visiting, home, start ts, network)]
+        self.fetched = {}          # sport -> (dates tuple, wall time)
+        self.cache = {}            # ESPN game id -> channel text ("" = none found)
+
+    def refresh(self, force=False):
+        for key, sport in TV_GUIDE_SPORTS.items():
+            if not self.cfg["enabled"].get(key, True) or not self.cfg.get("show_tv", True):
+                continue
+            dates = tuple(scoreboard_dates())
+            prev = self.fetched.get(sport)
+            if not force and prev and prev[0] == dates and time.time() - prev[1] < TV_GUIDE_REFRESH:
+                continue
+            rows = []
+            try:
+                for d in dates:
+                    rows += self._fetch(sport, "%s-%s-%s" % (d[:4], d[4:6], d[6:]))
+            except Exception as e:
+                if os.environ.get("LIVE_TICKER_DEBUG"):
+                    print("tv guide error", sport, repr(e), file=sys.stderr)
+                self.fetched[sport] = (dates, time.time() - TV_GUIDE_REFRESH + 120)   # retry in 2 min
+                continue
+            with self.lock:
+                self.entries[sport] = rows
+                self.cache = {k: v for k, v in self.cache.items() if not k.startswith(key + ":")}
+            self.fetched[sport] = (dates, time.time())
+
+    def _fetch(self, sport, day):
+        body = json.dumps({"query": TV_GUIDE_QUERY,
+                           "variables": {"input": {"sport": sport, "startDate": day}}}).encode()
+        req = urllib.request.Request(TV_GUIDE_API, data=body, headers={
+            "Content-Type": "application/json", "Accept": "application/json",
+            "User-Agent": HEADERS["User-Agent"], "Origin": "https://www.mattsarzsports.com"})
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        out = []
+        for g in ((data.get("data") or {}).get("dailyTvGames") or {}).get("tvGames") or []:
+            try:
+                ts = datetime.strptime(g["timeWithOffset"][:16], "%Y-%m-%dT%H:%M").replace(
+                    tzinfo=timezone.utc).timestamp()
+            except (KeyError, ValueError, TypeError):
+                ts = None
+            v = (g.get("visitingTeam") or [""])[0]
+            h = (g.get("homeTeam") or [""])[0]
+            net = re.sub(r"<[^>]+>", " ", g.get("network") or "").strip()
+            if net:
+                out.append((v, h, ts, " ".join(net.split())))
+        return out
+
+    def channel(self, g):
+        """Channel text for an ESPN game (matched schedule first, else ESPN's)."""
+        sport = TV_GUIDE_SPORTS.get(g["league"])
+        if not sport:
+            return g.get("espn_tv", "")
+        hit = self.cache.get(g["id"])
+        if hit is None:
+            hit = self._match(sport, g)
+            if hit or sport in self.entries:            # don't cache misses before data arrives
+                self.cache[g["id"]] = hit
+        return hit or g.get("espn_tv", "")
+
+    def _match(self, sport, g):
+        sides = [g["away"]["aliases"], g["home"]["aliases"]]
+        if not all(sides):
+            return ""
+        with self.lock:
+            rows = list(self.entries.get(sport, []))
+        scored = {}
+        for v, h, ts, net in rows:
+            if ts and g.get("start") and abs(ts - g["start"]) > 4 * 3600:
+                continue
+            # A Division I team plays once a day, so one exact name (2) or two
+            # loose ones (1 + 1) is enough to identify the game.
+            score = _team_score(v, sides) + _team_score(h, sides)
+            if score >= 2:
+                k = (v, h)
+                sc, nets = scored.get(k, (score, []))
+                if net not in nets:
+                    nets.append(net)
+                scored[k] = (sc, nets)
+        if not scored:
+            return ""
+        ranked = sorted(scored.values(), key=lambda x: -x[0])
+        if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+            return ""                                    # ambiguous: fall back to ESPN
+        return " / ".join(ranked[0][1][:3])
+
+
 class Feed:
     def __init__(self, lg, group):
         self.lg, self.group = lg, group
@@ -495,10 +680,19 @@ class DataHub:
             for grp in (lg["groups"] or [None]):
                 self.feeds.append(Feed(lg, grp))
         self.pool = ThreadPoolExecutor(max_workers=8)
+        self.tv = TvGuide(cfg)
 
     def start(self):
         threading.Thread(target=refresh_shared_cities, daemon=True).start()
+        threading.Thread(target=self._tv_loop, daemon=True).start()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def _tv_loop(self):
+        while self.running:
+            self.tv.refresh()
+            with self.lock:
+                self.version += 1          # redraw cards with any newly matched channels
+            time.sleep(30)
 
     def stop(self):
         self.running = False
@@ -901,6 +1095,8 @@ class TickerApp:
         dp.add_radiobutton(label="Names (Ohio State, Boston)", variable=self.v_names, value="short", command=self._names)
         dp.add_radiobutton(label="Abbreviations (OSU)", variable=self.v_names, value="abbr", command=self._names)
         dp.add_separator()
+        self.v_tv = tk.BooleanVar(value=self.cfg.get("show_tv", True))
+        dp.add_checkbutton(label="Show TV / streaming channel", variable=self.v_tv, command=self._show_tv)
         self.v_sit = tk.BooleanVar(value=self.cfg["show_situation"])
         dp.add_checkbutton(label="Show outs & runners (baseball/softball)", variable=self.v_sit, command=self._situation)
         self.v_hover = tk.BooleanVar(value=self.cfg["pause_on_hover"])
@@ -997,6 +1193,12 @@ class TickerApp:
 
     def _names(self):
         self._set("name_style", self.v_names.get())
+        self._refresh_visible(force=True)
+
+    def _show_tv(self):
+        self._set("show_tv", self.v_tv.get())
+        if self.v_tv.get():
+            threading.Thread(target=self.hub.tv.refresh, daemon=True).start()
         self._refresh_visible(force=True)
 
     def _situation(self):
@@ -1109,7 +1311,11 @@ class TickerApp:
                 segs.append(("small", "(%d)" % t["set_pts"], DIM_FG, 16))
         segs.append(("status", g["status"], STATUS_FG, 8))
         if g["extra"] and self.cfg["show_situation"]:
-            segs.append(("small", g["extra"], DIM_FG, 0))
+            segs.append(("small", g["extra"], DIM_FG, 8))
+        if self.cfg.get("show_tv", True):
+            tv = self.hub.tv.channel(g)
+            if tv:
+                segs.append(("small", tv, DIM_FG, 0))
         return segs
 
     def _header_segments(self, sport):
@@ -1267,7 +1473,7 @@ def _team_label(g, side):
     return ("#%d " % t["rank"] if t["rank"] else "") + display_name(g["league"], t)
 
 
-def write_html(path, games, updated):
+def write_html(path, games, updated, tv=None):
     """Save the --once results as a simple, self-contained HTML page."""
     import html
     esc = html.escape
@@ -1276,15 +1482,17 @@ def write_html(path, games, updated):
         sp = LEAGUE[g["league"]]["sport"]
         if sp != sport:
             sport = sp
-            rows.append('<tr class="group"><th colspan="5">%s</th></tr>' % esc(SPORT_LABEL[sp]))
+            rows.append('<tr class="group"><th colspan="6">%s</th></tr>' % esc(SPORT_LABEL[sp]))
         a, h = g["away"], g["home"]
         status = g["status"] + (" \u00b7 " + g["extra"] if g["extra"] else "")
         rows.append(
             '<tr><td class="team">%s</td><td class="score">%s</td>'
-            '<td class="team">%s</td><td class="score">%s</td><td class="status">%s</td></tr>'
-            % (esc(_team_label(g, "away")), esc(a["score"]), esc(_team_label(g, "home")), esc(h["score"]), esc(status)))
+            '<td class="team">%s</td><td class="score">%s</td><td class="status">%s</td>'
+            '<td class="tv">%s</td></tr>'
+            % (esc(_team_label(g, "away")), esc(a["score"]), esc(_team_label(g, "home")), esc(h["score"]),
+               esc(status), esc(tv.channel(g) if tv else g.get("espn_tv", ""))))
     if not rows:
-        rows.append('<tr><td colspan="5" class="none">No games in progress</td></tr>')
+        rows.append('<tr><td colspan="6" class="none">No games in progress</td></tr>')
     stamp = datetime.fromtimestamp(updated).strftime("%A, %B %d, %Y \u00b7 %I:%M:%S %p") if updated else "never"
     page = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1298,7 +1506,7 @@ def write_html(path, games, updated):
   td, th {{ padding:4px 14px 4px 0; text-align:left; white-space:nowrap; }}
   tr.group th {{ padding-top:16px; border-bottom:1px solid #444; letter-spacing:.04em; font-size:13px; }}
   td.score {{ font-weight:700; text-align:right; padding-right:22px; font-variant-numeric:tabular-nums; }}
-  td.status {{ color:#bbb; }}
+  td.status, td.tv {{ color:#bbb; }}
   td.none {{ color:#bbb; padding-top:12px; }}
 </style></head>
 <body>
@@ -1321,8 +1529,11 @@ def print_once(html_path="live_scores.html"):
     feeds = [f for f in hub.feeds if cfg["enabled"].get(f.lg["key"], True)]
     pool = ThreadPoolExecutor(8)
     cities = pool.submit(refresh_shared_cities)
+    guide = pool.submit(hub.tv.refresh, True) if cfg.get("show_tv", True) else None
     list(pool.map(hub._run, feeds))
     cities.result()
+    if guide:
+        guide.result()
     _, games = hub.snapshot()
     updated = hub.last_refresh()
     print("Updated %s  -  %d game%s in progress" % (fmt_time(updated), len(games), "" if len(games) == 1 else "s"))
@@ -1332,16 +1543,18 @@ def print_once(html_path="live_scores.html"):
             sport = LEAGUE[g["league"]]["sport"]
             print("\n%s" % SPORT_LABEL[sport])
         a, h = g["away"], g["home"]
-        line = "  %-26s %3s   %-26s %3s   %s" % (_team_label(g, "away"), a["score"], _team_label(g, "home"), h["score"], g["status"])
-        if g["extra"]:
-            line += "  (%s)" % g["extra"]
+        status = g["status"] + ("  (%s)" % g["extra"] if g["extra"] else "")
+        line = "  %-26s %3s   %-26s %3s   %-14s" % (_team_label(g, "away"), a["score"], _team_label(g, "home"),
+                                                     h["score"], status)
+        if cfg.get("show_tv", True):
+            line += "  %s" % hub.tv.channel(g)
         print(line)
     if not games:
         print("\nNo games in progress.")
     errs = [f.key for f in feeds if f.errors]
     if errs:
         print("\n(could not reach: %s)" % ", ".join(errs))
-    write_html(html_path, games, updated)
+    write_html(html_path, games, updated, hub.tv if cfg.get("show_tv", True) else None)
     print("\nSaved %s" % os.path.abspath(html_path))
 
 
