@@ -24,6 +24,32 @@ python live_ticker.py
 
 `python live_ticker.py --once` prints the current live list to the terminal (with the refresh time at the top) without opening a window, and also saves it as a web page, `live_scores.html`, in the current folder. Use `--once --html some/other/name.html` to save it somewhere else.
 
+## Read the scores aloud
+
+Right-click the ticker (or click ≡) and check **Display > Read scores aloud every 15 minutes**. It reads the live scores right away, then every 15 minutes, in the same order as the ticker , word for word as it appears on the ticker, including channels (for example: "Men's College Basketball. UMBC 50, George Mason 78, 1:41 2nd, ESPN+."). When no games are in progress, the reading is skipped. It uses your computer's built-in voice, so nothing extra to install. `python live_ticker.py --speak-test` reads the current scores once.
+
+## Watch it on your TV (GitHub Pages)
+
+`web/index.html` is the same ticker as a web page: same games, order, grouping, names and channels, scrolling the same way across the bottom of the screen. It fetches scores from ESPN itself in your TV's browser, so **your computer doesn't need to be on**.
+
+One-time setup:
+
+1. The repository must be **public** (GitHub Pages on a free account requires it).
+2. On GitHub, open the repo's **Settings > Pages**, and under **Build and deployment > Source** choose **GitHub Actions**.
+3. Push to `main` (or open the **Actions** tab and run **Web ticker (GitHub Pages)**). After a minute or two the page is at `https://YOUR-USERNAME.github.io/live-ticker/`.
+
+The workflow (`.github/workflows/pages.yml`) also runs every 20 minutes to refresh `channels.json`, today's college football and men's basketball channels from mattsarzsports.com (his site can't be read directly by other web pages, so GitHub fetches it). Other sports' channels come from ESPN, live. GitHub pauses scheduled workflows after 60 days with no commits to the repo; re-enable it on the Actions tab if that happens.
+
+Options, added to the address (combine with `&`):
+
+| Add | To |
+|---|---|
+| `?size=6` | Text size (percent of screen height; default 4.2) |
+| `?speed=100` | Scroll speed (default 70) |
+| `?position=top` | Put the bar at the `top`, `middle` or `bottom` (default) |
+| `?leagues=college` | Only college football and basketball, or a list like `?leagues=ncaaf,ncaam,nfl` |
+| `?tv=0` | Hide channels |
+
 ## Start it automatically when you log in
 
 Right-click the ticker (or click ≡) and check **Start automatically when I log in**. Uncheck it to turn it off. On Windows this adds Live Ticker to your startup apps, and it starts without a console window. You can also see or switch it off in **Settings > Apps > Startup**.

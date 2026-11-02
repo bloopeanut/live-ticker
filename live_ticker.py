@@ -17,6 +17,7 @@ import gzip
 import json
 import os
 import re
+import subprocess
 import ssl
 import sys
 import threading
@@ -125,6 +126,8 @@ DEFAULTS = {
     "live_poll": 6,              # seconds, everything else while live
     "bypass_cache": True,        # ask ESPN's CDN for a fresh copy every poll
     "show_tv": True,             # TV / streaming channel after each score
+    "speak": False,              # read the scores aloud every 15 minutes
+    "speak_minutes": 15,
     "enabled": {k: True for k in LEAGUE},
 }
 
@@ -981,6 +984,8 @@ class TickerApp:
         self.root.after(15, self._frame)
         self.root.after(250, self._pull_data)
         self.root.after(1000, self._each_second)
+        self.speak_due, self.speaking = None, False
+        self.root.after(3000, self._speech_tick)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
     # ---- setup -----------------------------------------------------------
@@ -1095,6 +1100,9 @@ class TickerApp:
         dp.add_radiobutton(label="Names (Ohio State, Boston)", variable=self.v_names, value="short", command=self._names)
         dp.add_radiobutton(label="Abbreviations (OSU)", variable=self.v_names, value="abbr", command=self._names)
         dp.add_separator()
+        self.v_speak = tk.BooleanVar(value=self.cfg.get("speak", False))
+        dp.add_checkbutton(label="Read scores aloud every %d minutes" % int(self.cfg.get("speak_minutes", 15)),
+                           variable=self.v_speak, command=self._toggle_speak)
         self.v_tv = tk.BooleanVar(value=self.cfg.get("show_tv", True))
         dp.add_checkbutton(label="Show TV / streaming channel", variable=self.v_tv, command=self._show_tv)
         self.v_sit = tk.BooleanVar(value=self.cfg["show_situation"])
@@ -1194,6 +1202,31 @@ class TickerApp:
     def _names(self):
         self._set("name_style", self.v_names.get())
         self._refresh_visible(force=True)
+
+    def _toggle_speak(self):
+        self._set("speak", self.v_speak.get())
+        self.speak_due = time.time() + 2 if self.v_speak.get() else None    # first reading right away
+
+    def _speech_tick(self):
+        """If a reading is due, read the current live scores (skipped when none are live)."""
+        if self.cfg.get("speak") and self.speak_due is None:
+            self.speak_due = time.time() + 8                  # app just started with speech on
+        if self.cfg.get("speak") and time.time() >= self.speak_due and not self.speaking:
+            self.speak_due = time.time() + 60 * float(self.cfg.get("speak_minutes", 15))
+            games = list(self.games)
+            if games:
+                self.speaking = True
+                text = speech_text(games, self.cfg, self.hub.tv, self.hub.last_refresh())
+
+                def run():
+                    try:
+                        speak(text)
+                    except Exception:
+                        pass
+                    finally:
+                        self.speaking = False
+                threading.Thread(target=run, daemon=True).start()
+        self.root.after(1000, self._speech_tick)
 
     def _show_tv(self):
         self._set("show_tv", self.v_tv.get())
@@ -1468,6 +1501,63 @@ class TickerApp:
 # Command line
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Spoken scores
+# --------------------------------------------------------------------------
+
+def ticker_parts(g, cfg, tv=None):
+    """The text of one game exactly as the ticker shows it, piece by piece."""
+    abbr = cfg.get("name_style") == "abbr"
+    out = []
+    for side in ("away", "home"):
+        t = g[side]
+        name = t["abbr"] if abbr else display_name(g["league"], t)
+        out.append(("#%d %s %s" % (t["rank"], name, t["score"])) if t["rank"] else "%s %s" % (name, t["score"]))
+    out.append(g["status"])
+    if g["extra"] and cfg.get("show_situation", True):
+        out.append(g["extra"])
+    if cfg.get("show_tv", True):
+        ch = tv.channel(g) if tv else g.get("espn_tv", "")
+        if ch:
+            out.append(ch)
+    return out
+
+
+def speech_text(games, cfg, tv=None, updated=None):
+    """Read exactly what the ticker shows, in the same order: the Updated time,
+    each group name once, then each game. Commas and periods only add pauses."""
+    parts = ["Updated %s." % fmt_time(updated or time.time())]
+    sport = None
+    for g in games:
+        sp = LEAGUE[g["league"]]["sport"]
+        if sp != sport:
+            sport = sp
+            label = SPORT_LABEL[sp]                   # all-caps words can get spelled out
+            parts.append((label if " " not in label else label.title().replace("'S", "'s")) + ".")
+        parts.append(", ".join(ticker_parts(g, cfg, tv)) + ".")
+    return " ".join(parts)
+
+
+def speak(text):
+    """Read text aloud with the computer's built-in voice. Blocks until done."""
+    if sys.platform == "win32":
+        ps = ("Add-Type -AssemblyName System.Speech; "
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+              "$s.Speak([Console]::In.ReadToEnd())")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       input=text, text=True, encoding="utf-8",
+                       creationflags=0x08000000)      # CREATE_NO_WINDOW
+    elif sys.platform == "darwin":
+        subprocess.run(["say"], input=text, text=True)
+    else:
+        for cmd in (["espeak", "--stdin"], ["spd-say", "-w", "-e"]):
+            try:
+                subprocess.run(cmd, input=text, text=True)
+                return
+            except FileNotFoundError:
+                continue
+
+
 def _team_label(g, side):
     t = g[side]
     return ("#%d " % t["rank"] if t["rank"] else "") + display_name(g["league"], t)
@@ -1558,12 +1648,63 @@ def print_once(html_path="live_scores.html"):
     print("\nSaved %s" % os.path.abspath(html_path))
 
 
+def export_channels(path):
+    """Save today's matched college football / men's basketball channels (from
+    mattsarzsports.com) as JSON keyed by ESPN game id, for the web ticker."""
+    cfg = load_config()
+    cfg["enabled"] = {k: True for k in LEAGUE}
+    guide = TvGuide(cfg)
+    guide.refresh(force=True)
+    channels = {}
+    for key, sport in TV_GUIDE_SPORTS.items():
+        lg = LEAGUE[key]
+        for grp in lg["groups"] or [None]:
+            feed = Feed(lg, grp)
+            for url in feed.urls(False):
+                try:
+                    data = fetch_json(url, timeout=20)
+                except Exception as e:
+                    print("could not fetch", url, e)
+                    continue
+                for ev in data.get("events") or []:
+                    g = parse_live_event(ev, lg)
+                    ch = guide._match(sport, g) if g else ""
+                    if ch:
+                        channels[str(ev.get("id"))] = ch
+    out = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "channels": channels}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, separators=(",", ":"))
+    os.replace(tmp, path)
+    print("Saved %d channels to %s" % (len(channels), path))
+
+
 def main():
     if "--once" in sys.argv:
         path = "live_scores.html"
         if "--html" in sys.argv and sys.argv.index("--html") + 1 < len(sys.argv):
             path = sys.argv[sys.argv.index("--html") + 1]
         print_once(path)
+        return
+    if "--channels-json" in sys.argv:
+        i = sys.argv.index("--channels-json")
+        export_channels(sys.argv[i + 1] if i + 1 < len(sys.argv) else "channels.json")
+        return
+    if "--speak-test" in sys.argv:
+        cfg = load_config()
+        hub = DataHub(cfg)
+        pool = ThreadPoolExecutor(8)
+        guide = pool.submit(hub.tv.refresh, True)
+        list(pool.map(hub._run, [f for f in hub.feeds if cfg["enabled"].get(f.lg["key"], True)]))
+        guide.result()
+        games = hub.snapshot()[1]
+        if not games:
+            print("No games in progress - nothing to read.")
+            return
+        text = speech_text(games, cfg, hub.tv, hub.last_refresh())
+        print(text)
+        if "--silent" not in sys.argv:
+            speak(text)
         return
     if "--startup-on" in sys.argv or "--startup-off" in sys.argv:
         on = "--startup-on" in sys.argv

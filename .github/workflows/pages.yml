@@ -1,0 +1,47 @@
+name: Web ticker (GitHub Pages)
+
+# Publishes web/ to GitHub Pages, with channels.json (today's college football
+# and men's basketball TV channels from mattsarzsports.com) rebuilt each run.
+# The page itself fetches live scores from ESPN in the viewer's browser.
+#
+# One-time setup: repo Settings > Pages > Build and deployment > Source: "GitHub Actions".
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7,27,47 * * * *"     # every 20 minutes, to keep channels.json current
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build channels.json
+        run: python live_ticker.py --channels-json web/channels.json || echo '{"channels":{}}' > web/channels.json
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
