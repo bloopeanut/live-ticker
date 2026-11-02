@@ -431,6 +431,34 @@ def sort_key(g):
     return (SPORT_ORDER[lg["sport"]], round(g["remaining"], 1), lg["order"], g["id"])
 
 
+def us_eastern_now():
+    """Current US Eastern time (ESPN's scoreboard day), without needing tz data."""
+    from datetime import timedelta
+    utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    y = utc.year
+
+    def nth_sunday(month, n):
+        d = datetime(y, month, 1)
+        d += timedelta(days=(6 - d.weekday()) % 7)      # first Sunday
+        return d + timedelta(weeks=n - 1)
+    dst_start = nth_sunday(3, 2) + timedelta(hours=7)     # 2 AM EST  = 07:00 UTC
+    dst_end = nth_sunday(11, 1) + timedelta(hours=6)      # 2 AM EDT  = 06:00 UTC
+    return utc - timedelta(hours=4 if dst_start <= utc < dst_end else 5)
+
+
+def scoreboard_dates():
+    """Dates to request. ESPN's undated scoreboard doesn't roll over to the new
+    day until late morning, so morning games would be missed; always ask for
+    today explicitly. Until 6 AM, also ask for yesterday so games that run past
+    midnight stay on the ticker."""
+    from datetime import timedelta
+    now = us_eastern_now()
+    days = [now]
+    if now.hour < 6:
+        days.insert(0, now - timedelta(days=1))
+    return [d.strftime("%Y%m%d") for d in days]
+
+
 class Feed:
     def __init__(self, lg, group):
         self.lg, self.group = lg, group
@@ -441,13 +469,18 @@ class Feed:
         self.last_ok = 0.0          # wall time of last successful fetch
         self.live_count = 0
 
-    def url(self, bypass):
-        q = ["limit=300"]           # NB: limit=1000 makes ESPN fall back to 25 games
-        if self.group is not None:
-            q.append("groups=%s" % self.group)
-        if bypass:
-            q.append("_=%d" % int(time.time() * 1000))
-        return "%s/%s/scoreboard?%s" % (API, self.lg["path"], "&".join(q))
+    def urls(self, bypass):
+        # NB: limit=1000 makes ESPN fall back to 25 games, and date ranges
+        # ("20261101-20261102") are rejected, so request one day at a time.
+        out = []
+        for day in scoreboard_dates():
+            q = ["limit=300", "dates=%s" % day]
+            if self.group is not None:
+                q.append("groups=%s" % self.group)
+            if bypass:
+                q.append("_=%d" % int(time.time() * 1000))
+            out.append("%s/%s/scoreboard?%s" % (API, self.lg["path"], "&".join(q)))
+        return out
 
 
 class DataHub:
@@ -509,8 +542,12 @@ class DataHub:
     def _run(self, f):
         interval = 30.0
         try:
-            data = fetch_json(f.url(self.cfg.get("bypass_cache", True)))
-            games, soonest = parse_scoreboard(data, f.lg)
+            games, soonest = [], None
+            for url in f.urls(self.cfg.get("bypass_cache", True)):
+                g, so = parse_scoreboard(fetch_json(url), f.lg)
+                games += g
+                if so is not None:
+                    soonest = so if soonest is None else min(soonest, so)
             f.errors = 0
             f.last_ok = time.time()
             f.live_count = len(games)
