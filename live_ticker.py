@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 APP_NAME = "Live Ticker"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".live_ticker.json")
 API = "https://site.api.espn.com/apis/site/v2/sports"
 
@@ -1100,9 +1100,6 @@ class TickerApp:
         dp.add_radiobutton(label="Names (Ohio State, Boston)", variable=self.v_names, value="short", command=self._names)
         dp.add_radiobutton(label="Abbreviations (OSU)", variable=self.v_names, value="abbr", command=self._names)
         dp.add_separator()
-        self.v_speak = tk.BooleanVar(value=self.cfg.get("speak", False))
-        dp.add_checkbutton(label="Read scores aloud every %d minutes" % int(self.cfg.get("speak_minutes", 15)),
-                           variable=self.v_speak, command=self._toggle_speak)
         self.v_tv = tk.BooleanVar(value=self.cfg.get("show_tv", True))
         dp.add_checkbutton(label="Show TV / streaming channel", variable=self.v_tv, command=self._show_tv)
         self.v_sit = tk.BooleanVar(value=self.cfg["show_situation"])
@@ -1122,6 +1119,9 @@ class TickerApp:
 
         m.add_separator()
         self.v_startup = tk.BooleanVar(value=startup_enabled())
+        self.v_speak = tk.BooleanVar(value=self.cfg.get("speak", False))
+        m.add_checkbutton(label="Read scores aloud every %d minutes" % int(self.cfg.get("speak_minutes", 15)),
+                          variable=self.v_speak, command=self._toggle_speak)
         m.add_checkbutton(label="Start automatically when I log in", variable=self.v_startup,
                           command=self._toggle_startup)
         m.add_separator()
@@ -1524,8 +1524,9 @@ def ticker_parts(g, cfg, tv=None):
 
 
 def speech_text(games, cfg, tv=None, updated=None):
-    """Read exactly what the ticker shows, in the same order: the Updated time,
-    each group name once, then each game. Commas and periods only add pauses."""
+    """Read what the ticker shows, in the same order: the Updated time, each
+    group name once, then each game with the leading team first (ties keep the
+    ticker's order). Commas and periods only add pauses."""
     parts = ["Updated %s." % fmt_time(updated or time.time())]
     sport = None
     for g in games:
@@ -1534,7 +1535,10 @@ def speech_text(games, cfg, tv=None, updated=None):
             sport = sp
             label = SPORT_LABEL[sp]                   # all-caps words can get spelled out
             parts.append((label if " " not in label else label.title().replace("'S", "'s")) + ".")
-        parts.append(", ".join(ticker_parts(g, cfg, tv)) + ".")
+        items = ticker_parts(g, cfg, tv)
+        if _num(g["home"]["score"]) > _num(g["away"]["score"]):    # say the team in the lead first
+            items[0], items[1] = items[1], items[0]
+        parts.append(", ".join(items) + ".")
     return " ".join(parts)
 
 
