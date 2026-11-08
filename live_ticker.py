@@ -128,7 +128,7 @@ DEFAULTS = {
     "show_tv": True,             # TV / streaming channel after each score
     "speak": False,              # read the scores aloud every 15 minutes
     "speak_minutes": 15,
-    "speech_boost": 0,           # dB added on top of the voice's maximum volume
+    "speech_over_apps": 12,      # Windows: speech this many dB louder than other apps while reading (0 = off)
     "enabled": {k: True for k in LEAGUE},
 }
 
@@ -987,6 +987,8 @@ class TickerApp:
         self.root.after(1000, self._each_second)
         self.speak_due, self.speaking = None, False
         self.root.after(3000, self._speech_tick)
+        if sys.platform == "win32" and os.path.exists(VOLUME_STATE_PATH):
+            threading.Thread(target=lambda: _safe(restore_volumes), daemon=True).start()   # left over from a crash
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
     # ---- setup -----------------------------------------------------------
@@ -1123,13 +1125,15 @@ class TickerApp:
         self.v_speak = tk.BooleanVar(value=self.cfg.get("speak", False))
         m.add_checkbutton(label="Read scores aloud every %d minutes" % int(self.cfg.get("speak_minutes", 15)),
                           variable=self.v_speak, command=self._toggle_speak)
-        sv = tk.Menu(m, tearoff=0)
-        self.v_boost = tk.IntVar(value=int(self.cfg.get("speech_boost", 0)))
-        for label, db in SPEECH_BOOSTS:
-            sv.add_radiobutton(label=label, variable=self.v_boost, value=db, command=self._set_boost)
-        sv.add_separator()
-        sv.add_command(label="Test it now", command=self._test_voice)
-        m.add_cascade(label="Speech volume", menu=sv)
+        if sys.platform == "win32":
+            # Speech volume = how far other apps (music, video) are turned down while it speaks
+            sv = tk.Menu(m, tearoff=0)
+            self.v_over = tk.IntVar(value=int(self.cfg.get("speech_over_apps", 12)))
+            for label, db in OVER_APPS:
+                sv.add_radiobutton(label=label, variable=self.v_over, value=db, command=self._set_over_apps)
+            sv.add_separator()
+            sv.add_command(label="Test it now", command=self._test_voice)
+            m.add_cascade(label="Speech volume", menu=sv)
         m.add_checkbutton(label="Start automatically when I log in", variable=self.v_startup,
                           command=self._toggle_startup)
         m.add_separator()
@@ -1211,8 +1215,8 @@ class TickerApp:
         self._set("name_style", self.v_names.get())
         self._refresh_visible(force=True)
 
-    def _set_boost(self):
-        self._set("speech_boost", self.v_boost.get())
+    def _set_over_apps(self):
+        self._set("speech_over_apps", self.v_over.get())
         self._test_voice()
 
     def _test_voice(self):
@@ -1226,9 +1230,9 @@ class TickerApp:
 
         def run():
             try:
-                speak(sample, int(self.cfg.get("speech_boost", 0)))
-            except Exception:
-                pass
+                speak(sample, 0, int(self.cfg.get("speech_over_apps", 12)))
+            except Exception as e:
+                log("speech test failed: %r" % e)
             finally:
                 self.speaking = False
         threading.Thread(target=run, daemon=True).start()
@@ -1250,9 +1254,9 @@ class TickerApp:
 
                 def run():
                     try:
-                        speak(text, int(self.cfg.get("speech_boost", 0)))
-                    except Exception:
-                        pass
+                        speak(text, 0, int(self.cfg.get("speech_over_apps", 12)))
+                    except Exception as e:
+                        log("read-aloud failed: %r" % e)
                     finally:
                         self.speaking = False
                 threading.Thread(target=run, daemon=True).start()
@@ -1572,7 +1576,6 @@ def speech_text(games, cfg, tv=None, updated=None):
     return " ".join(parts)
 
 
-SPEECH_BOOSTS = (("Normal", 0), ("Louder (+6 dB)", 6), ("Much louder (+10 dB)", 10), ("Maximum (+14 dB)", 14))
 
 
 def boost_wav(path, gain_db):
@@ -1584,8 +1587,10 @@ def boost_wav(path, gain_db):
     with wave.open(path, "rb") as w:
         params = w.getparams()
         frames = w.readframes(params.nframes)
-    if params.sampwidth != 2 or not frames:
-        return
+    if not frames:
+        raise ValueError("the voice produced no audio")
+    if params.sampwidth != 2:
+        raise ValueError("unsupported audio format (%d-bit)" % (8 * params.sampwidth))
     g = 10 ** (gain_db / 20.0)
     knee = 0.6 * 32767                                    # below this, plain gain
     table = array.array("h", bytes(2 * 65536))
@@ -1601,35 +1606,335 @@ def boost_wav(path, gain_db):
     if sys.byteorder == "big":
         samples.byteswap()
     out = array.array("h", [table[v & 0xFFFF] for v in samples])
+    level = lambda a: 20 * math.log10(max(1.0, (sum(v * v for v in a[::7]) / max(1, len(a[::7]))) ** 0.5) / 32767)
+    before, after = level(samples), level(out)
     if sys.byteorder == "big":
         out.byteswap()
     with wave.open(path, "wb") as w:
         w.setparams(params)
         w.writeframes(out.tobytes())
+    return {"rate": params.framerate, "channels": params.nchannels,
+            "before_db": round(before, 1), "after_db": round(after, 1),
+            "peak_before": max(abs(v) for v in samples) if len(samples) else 0}
 
 
-def speak(text, boost_db=0):
-    """Read text aloud with the computer's built-in voice. Blocks until done.
-    With boost_db > 0 the speech is recorded to a file, made louder, then played."""
-    if boost_db <= 0:
-        if sys.platform == "win32":
-            ps = ("Add-Type -AssemblyName System.Speech; "
-                  "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume = 100; "
-                  "$s.Speak([Console]::In.ReadToEnd())")
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           input=text, text=True, encoding="utf-8",
-                           creationflags=0x08000000)      # CREATE_NO_WINDOW
-        elif sys.platform == "darwin":
-            subprocess.run(["say"], input=text, text=True)
-        else:
-            for cmd in (["espeak", "--stdin"], ["spd-say", "-w", "-e"]):
-                try:
-                    subprocess.run(cmd, input=text, text=True)
-                    return
-                except FileNotFoundError:
-                    continue
-        return
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".live_ticker.log")
 
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+# How much louder than other apps (Winamp, Spotify, VLC...) the speech should be.
+OVER_APPS = (("Normal (other apps unchanged)", 0), ("A little louder than other apps", 6),
+             ("Clearly louder than other apps", 12), ("Much louder than other apps", 18))
+
+# ---- Windows: make speech louder than other apps --------------------------
+# Talks to the Windows Core Audio API directly (no PowerShell). Before changing
+# anything it saves every volume to VOLUME_STATE_PATH; after the reading it puts
+# them back, re-reads them to confirm, and only then deletes the file. If the app
+# is closed mid-reading, the next start (or --restore-volumes) restores them.
+VOLUME_STATE_PATH = os.path.join(os.path.expanduser("~"), ".live_ticker_volumes.json")
+
+
+class WinAudio:
+    CLSID_ENUM = "BCDE0395-E52F-467C-8E3D-C4579291692E"
+    IID_ENUM = "A95664D2-9614-4F35-A746-DE8DB63617E6"
+    IID_ENDPOINT_VOLUME = "5CDF2C82-841E-4546-9722-0CF74078229A"
+    IID_SESSION_MANAGER2 = "77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"
+    IID_SESSION_CONTROL2 = "BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"
+    IID_SIMPLE_VOLUME = "87CE5498-68D6-44E5-9215-6DA47EF883D8"
+    CLSCTX_ALL = 23
+
+    def __init__(self):
+        import ctypes
+        self.ct = ctypes
+        self.ole32 = ctypes.windll.ole32
+        self.kernel32 = ctypes.windll.kernel32
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("b", ctypes.c_ubyte * 16)]
+        self.GUID = GUID
+        self._held = []
+
+    # -- COM plumbing ------------------------------------------------------
+    def guid(self, s):
+        import uuid
+        return self.GUID.from_buffer_copy(uuid.UUID(s).bytes_le)
+
+    def call(self, obj, index, argtypes, *args):
+        """Call method number `index` of COM object `obj` (raises OSError on failure)."""
+        ct = self.ct
+        vtbl = ct.cast(obj, ct.POINTER(ct.POINTER(ct.c_void_p))).contents
+        proto = ct.WINFUNCTYPE(ct.HRESULT, ct.c_void_p, *argtypes)
+        return proto(vtbl[index])(obj, *args)
+
+    def release(self, obj):
+        ct = self.ct
+        if obj and obj.value:
+            vtbl = ct.cast(obj, ct.POINTER(ct.POINTER(ct.c_void_p))).contents
+            ct.WINFUNCTYPE(ct.c_ulong, ct.c_void_p)(vtbl[2])(obj)
+
+    def hold(self, obj):
+        self._held.append(obj)
+        return obj
+
+    def query(self, obj, iid):
+        ct = self.ct
+        out = ct.c_void_p()
+        g = self.guid(iid)
+        self.call(obj, 0, [ct.POINTER(self.GUID), ct.POINTER(ct.c_void_p)], ct.byref(g), ct.byref(out))
+        return self.hold(out)
+
+    def __enter__(self):
+        ct = self.ct
+        hr = self.ole32.CoInitializeEx(None, 2)            # apartment-threaded
+        self._uninit = hr in (0, 1)                         # S_OK / S_FALSE
+        enum = ct.c_void_p()
+        clsid, iid = self.guid(self.CLSID_ENUM), self.guid(self.IID_ENUM)
+        hr = self.ole32.CoCreateInstance(ct.byref(clsid), None, self.CLSCTX_ALL, ct.byref(iid), ct.byref(enum))
+        if hr != 0:
+            raise OSError("could not open Windows audio (0x%08X)" % (hr & 0xFFFFFFFF))
+        self.hold(enum)
+        dev = ct.c_void_p()
+        self.call(enum, 4, [ct.c_int, ct.c_int, ct.POINTER(ct.c_void_p)], 0, 1, ct.byref(dev))  # speakers, multimedia
+        self.dev = self.hold(dev)
+        self.epv = self.activate(self.IID_ENDPOINT_VOLUME)
+        return self
+
+    def __exit__(self, *exc):
+        for obj in reversed(self._held):
+            try:
+                self.release(obj)
+            except Exception:
+                pass
+        self._held = []
+        if self._uninit:
+            self.ole32.CoUninitialize()
+
+    def activate(self, iid):
+        ct = self.ct
+        out = ct.c_void_p()
+        g = self.guid(iid)
+        self.call(self.dev, 3, [ct.POINTER(self.GUID), ct.c_uint, ct.c_void_p, ct.POINTER(ct.c_void_p)],
+                  ct.byref(g), self.CLSCTX_ALL, None, ct.byref(out))
+        return self.hold(out)
+
+    # -- main volume (IAudioEndpointVolume) ----------------------------------
+    def master(self):
+        """(scalar 0..1, dB) of the Windows volume."""
+        ct = self.ct
+        sc, db = ct.c_float(), ct.c_float()
+        self.call(self.epv, 9, [ct.POINTER(ct.c_float)], ct.byref(sc))
+        self.call(self.epv, 8, [ct.POINTER(ct.c_float)], ct.byref(db))
+        return sc.value, db.value
+
+    def max_db(self):
+        ct = self.ct
+        lo, hi, inc = ct.c_float(), ct.c_float(), ct.c_float()
+        self.call(self.epv, 20, [ct.POINTER(ct.c_float)] * 3, ct.byref(lo), ct.byref(hi), ct.byref(inc))
+        return hi.value
+
+    def set_master_db(self, db):
+        ct = self.ct
+        self.call(self.epv, 6, [ct.c_float, ct.c_void_p], db, None)
+
+    def set_master_scalar(self, sc):
+        ct = self.ct
+        self.call(self.epv, 7, [ct.c_float, ct.c_void_p], sc, None)
+
+    # -- app volumes (sessions) ----------------------------------------------
+    def sessions(self):
+        """[(session instance id, process id, simple-volume object, level)]"""
+        ct = self.ct
+        mgr = self.activate(self.IID_SESSION_MANAGER2)
+        en = ct.c_void_p()
+        self.call(mgr, 5, [ct.POINTER(ct.c_void_p)], ct.byref(en))
+        self.hold(en)
+        n = ct.c_int()
+        self.call(en, 3, [ct.POINTER(ct.c_int)], ct.byref(n))
+        out = []
+        for i in range(n.value):
+            try:
+                ctl = ct.c_void_p()
+                self.call(en, 4, [ct.c_int, ct.POINTER(ct.c_void_p)], i, ct.byref(ctl))
+                self.hold(ctl)
+                ctl2 = self.query(ctl, self.IID_SESSION_CONTROL2)
+                pid = ct.c_uint()
+                self.call(ctl2, 14, [ct.POINTER(ct.c_uint)], ct.byref(pid))   # may be a multi-process session
+                sp = ct.c_void_p()
+                self.call(ctl2, 13, [ct.POINTER(ct.c_void_p)], ct.byref(sp))
+                sid = ct.wstring_at(sp.value) if sp.value else ""
+                if sp.value:
+                    self.ole32.CoTaskMemFree(sp)
+                vol = self.query(ctl, self.IID_SIMPLE_VOLUME)
+                lv = ct.c_float()
+                self.call(vol, 4, [ct.POINTER(ct.c_float)], ct.byref(lv))
+                if sid:
+                    out.append((sid, pid.value, vol, lv.value))
+            except OSError:
+                continue
+        return out
+
+    def set_level(self, vol, level):
+        ct = self.ct
+        self.call(vol, 3, [ct.c_float, ct.c_void_p], max(0.0, min(1.0, level)), None)
+
+    def process_name(self, pid):
+        ct = self.ct
+        if not pid:
+            return ""
+        h = self.kernel32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ct.create_unicode_buffer(520)
+            size = ct.c_uint(520)
+            if self.kernel32.QueryFullProcessImageNameW(h, 0, buf, ct.byref(size)):
+                return re.split(r"[\\/]", buf.value)[-1].rsplit(".", 1)[0]
+            return ""
+        finally:
+            self.kernel32.CloseHandle(h)
+
+
+def own_volume_full():
+    """Set this program's own volume (its entry in the Windows volume mixer) to
+    100%. Windows remembers each app's level between runs, so a level lowered
+    earlier would otherwise make every reading a whisper."""
+    with WinAudio() as wa:
+        fixed = 0
+        for sid, pid, vol, lv in wa.sessions():
+            if pid == os.getpid() and lv < 0.999:
+                wa.set_level(vol, 1.0)
+                fixed += 1
+    return fixed
+
+
+def _wake_audio_windows():
+    """Play 50 ms of silence so Windows creates this program's mixer entry
+    (it only exists once we've played a sound), then make sure it's at 100%."""
+    import tempfile
+    import wave
+    import winsound
+    fd, path = tempfile.mkstemp(prefix="live_ticker_silence_", suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(bytes(2 * 1102))
+        winsound.PlaySound(path, 0x00020000)          # SND_FILENAME, synchronous
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return own_volume_full()
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception as e:
+        log("%s failed: %r" % (getattr(fn, "__name__", "task"), e))
+
+
+def _save_volume_state(state):
+    tmp = VOLUME_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, VOLUME_STATE_PATH)
+
+
+def duck_other_apps(rel_db, keep_pid):
+    """Raise the Windows volume by up to rel_db and lower every other app by
+    rel_db. Saves the original volumes first. Returns (old %, new %, app names)."""
+    restore_volumes()                                    # never stack on top of an unrestored change
+    with WinAudio() as wa:
+        old_sc, old_db = wa.master()
+        sessions = [x for x in wa.sessions() if x[1] != keep_pid]
+        _save_volume_state({"master_scalar": old_sc, "master_db": old_db,
+                            "sessions": {sid: lv for sid, pid, vol, lv in sessions}})
+        target = min(wa.max_db(), old_db + rel_db)
+        if target > old_db + 0.01:
+            wa.set_master_db(target)
+        factor = 10 ** (-rel_db / 20.0)
+        names = set()
+        for sid, pid, vol, lv in sessions:
+            wa.set_level(vol, lv * factor)
+            names.add(wa.process_name(pid) or ("System sounds" if pid == 0 else "pid %d" % pid))
+        new_sc = wa.master()[0]
+    return ("%.0f" % (old_sc * 100), "%.0f" % (new_sc * 100), ", ".join(sorted(names, key=str.lower)))
+
+
+def restore_volumes():
+    """Put back the volumes saved by duck_other_apps and confirm they took.
+    Returns True when everything is back (or nothing needed restoring)."""
+    try:
+        with open(VOLUME_STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return True
+    saved = state.get("sessions") or {}
+    ok = False
+    for attempt in range(3):
+        with WinAudio() as wa:
+            for sid, pid, vol, lv in wa.sessions():
+                if sid in saved:
+                    try:                                   # one stubborn app mustn't stop the rest
+                        wa.set_level(vol, saved[sid])
+                    except OSError as e:
+                        log("restore app volume: %r" % e)
+            try:
+                wa.set_master_scalar(float(state["master_scalar"]))
+            except OSError as e:
+                log("restore Windows volume: %r" % e)
+            # confirm
+            sc = wa.master()[0]
+            now = {sid: lv for sid, pid, vol, lv in wa.sessions()}
+        bad = [sid for sid, lv in saved.items() if sid in now and abs(now[sid] - lv) > 0.01]
+        if abs(sc - float(state["master_scalar"])) <= 0.01 and not bad:
+            ok = True
+            break
+        time.sleep(0.3)
+    if ok:
+        try:
+            os.remove(VOLUME_STATE_PATH)
+        except OSError:
+            pass
+    else:
+        log("could not confirm volumes were restored; will retry next time")
+    return ok
+
+
+def _speak_direct(text):
+    """Plain read-aloud straight to the speakers (fallback)."""
+    if sys.platform == "win32":
+        ps = ("Add-Type -AssemblyName System.Speech; "
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume = 100; "
+              "$s.Speak([Console]::In.ReadToEnd())")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       input=text, text=True, encoding="utf-8", creationflags=0x08000000)
+    elif sys.platform == "darwin":
+        subprocess.run(["say"], input=text, text=True)
+    else:
+        for cmd in (["espeak", "--stdin"], ["spd-say", "-w", "-e"]):
+            try:
+                subprocess.run(cmd, input=text, text=True)
+                return
+            except FileNotFoundError:
+                continue
+
+
+def speak(text, boost_db=0, over_apps_db=0):
+    """Read text aloud. Every volume level (Normal included) records the voice
+    to a file, boosts it by boost_db, and plays it, so levels compare fairly.
+    Returns measurements of what was played; falls back to plain speech on error."""
     import tempfile
     fd, wav = tempfile.mkstemp(prefix="live_ticker_", suffix=".wav")
     os.close(fd)
@@ -1637,22 +1942,57 @@ def speak(text, boost_db=0):
         if sys.platform == "win32":
             ps = ("Add-Type -AssemblyName System.Speech; "
                   "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume = 100; "
-                  "$s.SetOutputToWaveFile($env:LIVE_TICKER_WAV); "
+                  "$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(22050, "
+                  "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, "
+                  "[System.Speech.AudioFormat.AudioChannel]::Mono); "
+                  "$s.SetOutputToWaveFile($env:LIVE_TICKER_WAV, $fmt); "
                   "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()")
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                            input=text, text=True, encoding="utf-8", creationflags=0x08000000,
-                           env=dict(os.environ, LIVE_TICKER_WAV=wav))
-            boost_wav(wav, boost_db)
-            import winsound
-            winsound.PlaySound(wav, winsound.SND_FILENAME)
+                           env=dict(os.environ, LIVE_TICKER_WAV=wav), check=True)
+            play = lambda: __import__("winsound").PlaySound(wav, 0x00020000)     # SND_FILENAME
         elif sys.platform == "darwin":
-            subprocess.run(["say", "-o", wav, "--data-format=LEI16@22050"], input=text, text=True)
-            boost_wav(wav, boost_db)
-            subprocess.run(["afplay", wav])
+            subprocess.run(["say", "-o", wav, "--data-format=LEI16@22050"], input=text, text=True, check=True)
+            play = lambda: subprocess.run(["afplay", wav])
         else:
-            subprocess.run(["espeak", "--stdin", "-w", wav], input=text, text=True)
-            boost_wav(wav, boost_db)
-            subprocess.run(["aplay", "-q", wav])
+            subprocess.run(["espeak", "--stdin", "-w", wav], input=text, text=True, check=True)
+            play = lambda: subprocess.run(["aplay", "-q", wav])
+        if not os.path.getsize(wav):
+            raise RuntimeError("the speech engine did not write any audio")
+        info = boost_wav(wav, boost_db)
+        if sys.platform == "win32":
+            try:
+                if _wake_audio_windows():
+                    log("this program's own volume was below 100%; set it back to 100%")
+                    info["own_fixed"] = True
+            except Exception as e:
+                log("could not check this program's own volume: %r" % e)
+        ducked = False
+        if over_apps_db > 0 and sys.platform == "win32":
+            try:
+                info["over_apps"] = duck_other_apps(over_apps_db, os.getpid())
+                ducked = True
+            except Exception as e:
+                log("could not lower other apps: %r" % e)
+                info["over_apps_error"] = str(e)
+                try:
+                    restore_volumes()
+                except Exception:
+                    pass
+        try:
+            play()
+        finally:
+            if ducked:
+                try:
+                    info["restored"] = restore_volumes()
+                except Exception as e:
+                    log("restoring volumes failed: %r" % e)
+                    info["restored"] = False
+        return info
+    except Exception as e:
+        log("louder speech unavailable, using plain voice: %r" % e)
+        _speak_direct(text)
+        return None
     finally:
         try:
             os.remove(wav)
@@ -1792,6 +2132,39 @@ def main():
         i = sys.argv.index("--channels-json")
         export_channels(sys.argv[i + 1] if i + 1 < len(sys.argv) else "channels.json")
         return
+    if "--volume-test" in sys.argv:
+        if sys.platform == "win32" and os.path.exists(VOLUME_STATE_PATH):
+            print("Restoring volumes left over from an earlier run:", "done" if restore_volumes() else "FAILED")
+        print("Playing the same sentence at each setting. Start your music first to hear the difference.\n")
+        tests = [("Normal", 0, 0)]
+        if sys.platform == "win32":
+            tests += [(label.replace(" than other apps", ""), 0, db) for label, db in OVER_APPS if db]
+        for label, db, over in tests:
+            print("%-22s" % label, end=" ", flush=True)
+            try:
+                info = speak("This is %s. Ohio State 31, Penn State 24, 4:12 4th, FOX." % label.replace(":", ""), db, over)
+                if not info:
+                    print("played WITHOUT any boost - see %s" % LOG_PATH)
+                    continue
+                line = "voice %.1f dB -> %.1f dB" % (info["before_db"], info["after_db"])
+                if info.get("own_fixed"):
+                    line += " (the ticker's own volume was low - set back to 100%)"
+                if info.get("over_apps"):
+                    old, new, names = info["over_apps"]
+                    line += ", Windows volume %s%% -> %s%%, lowered: %s" % (old, new, names or "(no other apps playing)")
+                    line += "; restored" if info.get("restored") else "; NOT restored - run --restore-volumes"
+                if info.get("over_apps_error"):
+                    line += ", could NOT adjust other apps: " + info["over_apps_error"][:160]
+                print(line)
+            except Exception as e:
+                print("FAILED: %r" % e)
+        return
+    if "--restore-volumes" in sys.argv:
+        if not os.path.exists(VOLUME_STATE_PATH):
+            print("Nothing to restore: no volume changes are pending.")
+        else:
+            print("Volumes restored." if restore_volumes() else "Could not restore volumes - see %s" % LOG_PATH)
+        return
     if "--speak-test" in sys.argv:
         cfg = load_config()
         hub = DataHub(cfg)
@@ -1806,7 +2179,7 @@ def main():
         text = speech_text(games, cfg, hub.tv, hub.last_refresh())
         print(text)
         if "--silent" not in sys.argv:
-            speak(text, int(cfg.get("speech_boost", 0)))
+            speak(text, 0, int(cfg.get("speech_over_apps", 12)))
         return
     if "--startup-on" in sys.argv or "--startup-off" in sys.argv:
         on = "--startup-on" in sys.argv
