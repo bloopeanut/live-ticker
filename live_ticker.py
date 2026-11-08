@@ -128,6 +128,7 @@ DEFAULTS = {
     "show_tv": True,             # TV / streaming channel after each score
     "speak": False,              # read the scores aloud every 15 minutes
     "speak_minutes": 15,
+    "speech_boost": 0,           # dB added on top of the voice's maximum volume
     "enabled": {k: True for k in LEAGUE},
 }
 
@@ -1122,6 +1123,13 @@ class TickerApp:
         self.v_speak = tk.BooleanVar(value=self.cfg.get("speak", False))
         m.add_checkbutton(label="Read scores aloud every %d minutes" % int(self.cfg.get("speak_minutes", 15)),
                           variable=self.v_speak, command=self._toggle_speak)
+        sv = tk.Menu(m, tearoff=0)
+        self.v_boost = tk.IntVar(value=int(self.cfg.get("speech_boost", 0)))
+        for label, db in SPEECH_BOOSTS:
+            sv.add_radiobutton(label=label, variable=self.v_boost, value=db, command=self._set_boost)
+        sv.add_separator()
+        sv.add_command(label="Test it now", command=self._test_voice)
+        m.add_cascade(label="Speech volume", menu=sv)
         m.add_checkbutton(label="Start automatically when I log in", variable=self.v_startup,
                           command=self._toggle_startup)
         m.add_separator()
@@ -1203,6 +1211,28 @@ class TickerApp:
         self._set("name_style", self.v_names.get())
         self._refresh_visible(force=True)
 
+    def _set_boost(self):
+        self._set("speech_boost", self.v_boost.get())
+        self._test_voice()
+
+    def _test_voice(self):
+        """Short sample at the chosen volume, so you can compare levels."""
+        if self.speaking:
+            return
+        self.speaking = True
+        games = list(self.games)
+        sample = (", ".join(ticker_parts(games[0], self.cfg, self.hub.tv)) + "." if games
+                  else "This is how loud the score readings will be.")
+
+        def run():
+            try:
+                speak(sample, int(self.cfg.get("speech_boost", 0)))
+            except Exception:
+                pass
+            finally:
+                self.speaking = False
+        threading.Thread(target=run, daemon=True).start()
+
     def _toggle_speak(self):
         self._set("speak", self.v_speak.get())
         self.speak_due = time.time() + 2 if self.v_speak.get() else None    # first reading right away
@@ -1220,7 +1250,7 @@ class TickerApp:
 
                 def run():
                     try:
-                        speak(text)
+                        speak(text, int(self.cfg.get("speech_boost", 0)))
                     except Exception:
                         pass
                     finally:
@@ -1542,24 +1572,92 @@ def speech_text(games, cfg, tv=None, updated=None):
     return " ".join(parts)
 
 
-def speak(text):
-    """Read text aloud with the computer's built-in voice. Blocks until done."""
-    if sys.platform == "win32":
-        ps = ("Add-Type -AssemblyName System.Speech; "
-              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-              "$s.Speak([Console]::In.ReadToEnd())")
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                       input=text, text=True, encoding="utf-8",
-                       creationflags=0x08000000)      # CREATE_NO_WINDOW
-    elif sys.platform == "darwin":
-        subprocess.run(["say"], input=text, text=True)
-    else:
-        for cmd in (["espeak", "--stdin"], ["spd-say", "-w", "-e"]):
-            try:
-                subprocess.run(cmd, input=text, text=True)
-                return
-            except FileNotFoundError:
-                continue
+SPEECH_BOOSTS = (("Normal", 0), ("Louder (+6 dB)", 6), ("Much louder (+10 dB)", 10), ("Maximum (+14 dB)", 14))
+
+
+def boost_wav(path, gain_db):
+    """Make a 16-bit WAV louder in place. Peaks are rounded off smoothly
+    (soft limiting) instead of clipping, so it gets louder without crackling."""
+    import array
+    import math
+    import wave
+    with wave.open(path, "rb") as w:
+        params = w.getparams()
+        frames = w.readframes(params.nframes)
+    if params.sampwidth != 2 or not frames:
+        return
+    g = 10 ** (gain_db / 20.0)
+    knee = 0.6 * 32767                                    # below this, plain gain
+    table = array.array("h", bytes(2 * 65536))
+    for x in range(-32768, 32768):
+        y = x * g
+        a = abs(y)
+        if a > knee:                                      # smooth curve from the knee up to full scale
+            a = knee + (32767 - knee) * math.tanh((a - knee) / (32767 - knee))
+            y = a if y > 0 else -a
+        table[x & 0xFFFF] = int(max(-32767, min(32767, round(y))))
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    out = array.array("h", [table[v & 0xFFFF] for v in samples])
+    if sys.byteorder == "big":
+        out.byteswap()
+    with wave.open(path, "wb") as w:
+        w.setparams(params)
+        w.writeframes(out.tobytes())
+
+
+def speak(text, boost_db=0):
+    """Read text aloud with the computer's built-in voice. Blocks until done.
+    With boost_db > 0 the speech is recorded to a file, made louder, then played."""
+    if boost_db <= 0:
+        if sys.platform == "win32":
+            ps = ("Add-Type -AssemblyName System.Speech; "
+                  "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume = 100; "
+                  "$s.Speak([Console]::In.ReadToEnd())")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           input=text, text=True, encoding="utf-8",
+                           creationflags=0x08000000)      # CREATE_NO_WINDOW
+        elif sys.platform == "darwin":
+            subprocess.run(["say"], input=text, text=True)
+        else:
+            for cmd in (["espeak", "--stdin"], ["spd-say", "-w", "-e"]):
+                try:
+                    subprocess.run(cmd, input=text, text=True)
+                    return
+                except FileNotFoundError:
+                    continue
+        return
+
+    import tempfile
+    fd, wav = tempfile.mkstemp(prefix="live_ticker_", suffix=".wav")
+    os.close(fd)
+    try:
+        if sys.platform == "win32":
+            ps = ("Add-Type -AssemblyName System.Speech; "
+                  "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Volume = 100; "
+                  "$s.SetOutputToWaveFile($env:LIVE_TICKER_WAV); "
+                  "$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           input=text, text=True, encoding="utf-8", creationflags=0x08000000,
+                           env=dict(os.environ, LIVE_TICKER_WAV=wav))
+            boost_wav(wav, boost_db)
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_FILENAME)
+        elif sys.platform == "darwin":
+            subprocess.run(["say", "-o", wav, "--data-format=LEI16@22050"], input=text, text=True)
+            boost_wav(wav, boost_db)
+            subprocess.run(["afplay", wav])
+        else:
+            subprocess.run(["espeak", "--stdin", "-w", wav], input=text, text=True)
+            boost_wav(wav, boost_db)
+            subprocess.run(["aplay", "-q", wav])
+    finally:
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
 
 
 def _team_label(g, side):
@@ -1708,7 +1806,7 @@ def main():
         text = speech_text(games, cfg, hub.tv, hub.last_refresh())
         print(text)
         if "--silent" not in sys.argv:
-            speak(text)
+            speak(text, int(cfg.get("speech_boost", 0)))
         return
     if "--startup-on" in sys.argv or "--startup-off" in sys.argv:
         on = "--startup-on" in sys.argv

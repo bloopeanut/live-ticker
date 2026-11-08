@@ -26,7 +26,7 @@ python live_ticker.py
 
 ## Read the scores aloud
 
-Right-click the ticker (or click ≡) and check **Read scores aloud every 15 minutes**. It reads the live scores right away, then every 15 minutes, word for word as it appears on the ticker, including channels, except that the team in the lead is read first (for example: "Men's College Basketball. George Mason 78, UMBC 50, 1:41 2nd, ESPN+."). When no games are in progress, the reading is skipped. It uses your computer's built-in voice, so nothing extra to install. `python live_ticker.py --speak-test` reads the current scores once.
+Right-click the ticker (or click ≡) and check **Read scores aloud every 15 minutes**. It reads the live scores right away, then every 15 minutes, word for word as it appears on the ticker, including channels, except that the team in the lead is read first (for example: "Men's College Basketball. George Mason 78, UMBC 50, 1:41 2nd, ESPN+."). When no games are in progress, the reading is skipped. If it's too quiet, use **Speech volume** on the same menu: the voice already plays at its maximum, so Louder / Much louder / Maximum boost the recording itself by up to about 4×, smoothing the peaks so it doesn't crackle. **Test it now** plays a short sample. It uses your computer's built-in voice, so nothing extra to install. `python live_ticker.py --speak-test` reads the current scores once.
 
 ## Watch it on your TV (GitHub Pages)
 
